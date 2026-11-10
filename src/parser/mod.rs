@@ -134,7 +134,7 @@ impl From<TokenizerError> for ParserError {
             kind,
         } = error;
         match kind {
-            TokenizerErrorKind::OutOfMemory => ParserError::OutOfMemory { needed: 0 },
+            TokenizerErrorKind::OutOfMemory { needed } => ParserError::OutOfMemory { needed },
             TokenizerErrorKind::Syntax => {
                 let mut room = funding::Measure(0);
                 let fits = fmt::write(&mut room, format_args!("{location}")).is_ok()

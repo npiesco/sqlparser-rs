@@ -194,7 +194,7 @@ impl<'a> Parser<'a> {
     /// that is refused.
     pub(crate) fn tokenizer_error(&self, error: &TokenizerError) -> ParserError {
         match error.kind {
-            TokenizerErrorKind::OutOfMemory => ParserError::OutOfMemory { needed: 0 },
+            TokenizerErrorKind::OutOfMemory { needed } => ParserError::OutOfMemory { needed },
             TokenizerErrorKind::Syntax => match self.format(format_args!("{error}")) {
                 Ok(message) => ParserError::TokenizerError(message),
                 Err(refused) => refused,
@@ -419,6 +419,91 @@ impl<'a> Parser<'a> {
         match value {
             Some(value) => self.boxed(value).map(Some),
             None => Ok(None),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use super::{Parser, ParserError};
+    use crate::dialect::GenericDialect;
+    use crate::tokenizer::{TokenWithSpan, Tokenizer, TokenizerFunding};
+
+    /// At most `limit` bytes charged at once; what the last charge it refused asked for, and
+    /// the most it held, recorded.
+    struct Limited {
+        limit: usize,
+        charged: Cell<usize>,
+        peak: Cell<usize>,
+        refused: Cell<usize>,
+    }
+
+    impl Limited {
+        fn new(limit: usize) -> Self {
+            Self {
+                limit,
+                charged: Cell::new(0),
+                peak: Cell::new(0),
+                refused: Cell::new(0),
+            }
+        }
+    }
+
+    impl TokenizerFunding for Limited {
+        fn charge(&self, bytes: usize) -> bool {
+            let charged = self.charged.get() + bytes;
+            if charged > self.limit {
+                self.refused.set(bytes);
+                return false;
+            }
+            self.charged.set(charged);
+            self.peak.set(self.peak.get().max(charged));
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            self.charged.set(self.charged.get() - bytes);
+        }
+    }
+
+    /// `sql` tokenized, then parsed, both within `funding`: how many statements it holds.
+    fn parsed(funding: &Limited, sql: &str) -> Result<usize, ParserError> {
+        let dialect = GenericDialect {};
+        let mut tokens: Vec<TokenWithSpan> = Vec::new();
+        Tokenizer::new(&dialect, sql)
+            .with_funding(funding)
+            .tokenize_with_location_into_buf(&mut tokens)?;
+        let mut parser = Parser::new(&dialect)
+            .with_funding(funding)
+            .with_tokens_with_locations(tokens);
+        parser.parse_statements().map(|statements| statements.len())
+    }
+
+    #[test]
+    fn a_refusal_carries_the_bytes_the_refused_charge_asked_for() {
+        for sql in [
+            "SELECT 'it''s', 1 WHERE false",
+            "SELECT a, b FROM t WHERE x > 1",
+            "CREATE VIEW v AS SELECT a FROM t",
+        ] {
+            let ample = Limited::new(usize::MAX);
+            assert_eq!(parsed(&ample, sql), Ok(1), "{sql}");
+            for limit in 0..ample.peak.get() {
+                let funding = Limited::new(limit);
+                let refused = parsed(&funding, sql);
+                let needed = funding.refused.get();
+                assert!(
+                    needed > 0,
+                    "{sql} within {limit} bytes: a charge was refused"
+                );
+                assert_eq!(
+                    refused,
+                    Err(ParserError::OutOfMemory { needed }),
+                    "{sql} within {limit} bytes: refused for what the refused charge asked for"
+                );
+            }
         }
     }
 }

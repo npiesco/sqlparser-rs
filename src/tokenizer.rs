@@ -803,22 +803,26 @@ pub enum TokenizerErrorKind {
     Syntax,
     /// What the tokenizer had to allocate was refused: by its [`TokenizerFunding`], or by the
     /// allocator. Nothing was allocated for it, and its `message` is empty.
-    OutOfMemory,
+    OutOfMemory {
+        /// The bytes the refused charge asked for.
+        needed: usize,
+    },
 }
 
 impl TokenizerError {
-    /// The error for an allocation that was refused, itself allocating nothing.
-    pub fn out_of_memory() -> Self {
+    /// The error for an allocation of `needed` bytes that was refused, itself allocating
+    /// nothing.
+    pub fn out_of_memory(needed: usize) -> Self {
         Self {
             message: String::new(),
             location: Location::empty(),
-            kind: TokenizerErrorKind::OutOfMemory,
+            kind: TokenizerErrorKind::OutOfMemory { needed },
         }
     }
 
     /// Whether what the tokenizer had to allocate was refused.
     pub fn is_out_of_memory(&self) -> bool {
-        self.kind == TokenizerErrorKind::OutOfMemory
+        matches!(self.kind, TokenizerErrorKind::OutOfMemory { .. })
     }
 }
 
@@ -826,7 +830,9 @@ impl fmt::Display for TokenizerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
             TokenizerErrorKind::Syntax => write!(f, "{}{}", self.message, self.location,),
-            TokenizerErrorKind::OutOfMemory => f.write_str("out of memory"),
+            TokenizerErrorKind::OutOfMemory { needed } => {
+                write!(f, "out of memory: {needed} bytes refused")
+            }
         }
     }
 }
@@ -882,8 +888,8 @@ impl<'f> Funding<'f> {
 }
 
 impl From<Refused> for TokenizerError {
-    fn from(_: Refused) -> Self {
-        Self::out_of_memory()
+    fn from(refused: Refused) -> Self {
+        Self::out_of_memory(refused.needed)
     }
 }
 
@@ -4809,12 +4815,15 @@ mod tests {
     struct Limited {
         limit: usize,
         charged: core::cell::Cell<usize>,
+        /// The bytes the last refused charge asked for.
+        refused: core::cell::Cell<usize>,
     }
 
     impl TokenizerFunding for Limited {
         fn charge(&self, bytes: usize) -> bool {
             let charged = self.charged.get() + bytes;
             if charged > self.limit {
+                self.refused.set(bytes);
                 return false;
             }
             self.charged.set(charged);
@@ -4852,6 +4861,7 @@ mod tests {
         let ample = Limited {
             limit: usize::MAX,
             charged: core::cell::Cell::new(0),
+            refused: core::cell::Cell::new(0),
         };
         let mut tokens = vec![];
         Tokenizer::new(&dialect, sql)
@@ -4869,13 +4879,21 @@ mod tests {
             let funding = Limited {
                 limit,
                 charged: core::cell::Cell::new(0),
+                refused: core::cell::Cell::new(0),
             };
             let mut tokens = vec![];
             let refused = Tokenizer::new(&dialect, sql)
                 .with_funding(&funding)
                 .tokenize_with_location_into_buf(&mut tokens)
                 .expect_err("refused within less than it needs");
-            assert!(refused.is_out_of_memory(), "{refused:?}");
+            let asked = funding.refused.get();
+            assert!(asked > 0, "within {limit} bytes, a charge was refused");
+            assert_eq!(
+                refused.kind,
+                TokenizerErrorKind::OutOfMemory { needed: asked },
+                "refused for exactly what the refused charge asked for"
+            );
+            assert!(refused.is_out_of_memory());
             assert_eq!(refused.message, "");
             assert_eq!(
                 funding.charged.get(),
@@ -4891,6 +4909,7 @@ mod tests {
         let funding = Limited {
             limit: usize::MAX,
             charged: core::cell::Cell::new(0),
+            refused: core::cell::Cell::new(0),
         };
         let mut tokens = vec![];
         let error = Tokenizer::new(&dialect, "SELECT 'open")
