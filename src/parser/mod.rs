@@ -2046,7 +2046,8 @@ impl<'a> Parser<'a> {
                         // Postgres explicitly allows funcnm(tablenm.*) and the
                         // function array_agg traverses this control flow
                         if dialect_of!(self is PostgreSqlDialect) {
-                            ending_wildcard = Some(self.next_token());
+                            self.advance_token();
+                            ending_wildcard = Some(self.copied(self.get_current_token())?);
                         } else {
                             // Put back the consumed `.` tokens before exiting.
                             // If this expression is being parsed in the
@@ -2059,16 +2060,20 @@ impl<'a> Parser<'a> {
                         break;
                     }
                     Token::SingleQuotedString(s) => {
-                        let expr =
-                            Expr::Identifier(Ident::with_quote_and_span('\'', next_token.span, s));
-                        chain.push(AccessExpr::Dot(expr));
+                        let expr = Expr::Identifier(Ident::with_quote_and_span(
+                            '\'',
+                            next_token.span,
+                            self.string(s)?,
+                        ));
+                        self.push(&mut chain, AccessExpr::Dot(expr))?;
                         self.advance_token(); // The consumed string
                     }
                     Token::Placeholder(s) => {
                         // Snowflake uses $1, $2, etc. for positional column references
                         // in staged data queries like: SELECT t.$1 FROM @stage t
-                        let expr = Expr::Identifier(Ident::with_span(next_token.span, s));
-                        chain.push(AccessExpr::Dot(expr));
+                        let expr =
+                            Expr::Identifier(Ident::with_span(next_token.span, self.string(s)?));
+                        self.push(&mut chain, AccessExpr::Dot(expr))?;
                         self.advance_token(); // The consumed placeholder
                     }
                     // Fallback to parsing an arbitrary expression, but restrict to expression
@@ -2102,22 +2107,30 @@ impl<'a> Parser<'a> {
                             // `foo.(bar.baz)` (i.e. a root with an access chain with
                             // 1 entry`).
                             Some(Expr::CompoundFieldAccess { root, access_chain }) => {
-                                chain.push(AccessExpr::Dot(*root));
-                                chain.extend(access_chain);
+                                let root = self.unboxed(root);
+                                self.push(&mut chain, AccessExpr::Dot(root))?;
+                                self.grow(&mut chain, access_chain.len())?;
+                                self.each(access_chain, |access| {
+                                    chain.push(access);
+                                    Ok(())
+                                })?;
                             }
-                            Some(Expr::CompoundIdentifier(parts)) => chain.extend(
-                                parts.into_iter().map(Expr::Identifier).map(AccessExpr::Dot),
-                            ),
+                            Some(Expr::CompoundIdentifier(parts)) => {
+                                self.grow(&mut chain, parts.len())?;
+                                self.each(parts, |part| {
+                                    chain.push(AccessExpr::Dot(Expr::Identifier(part)));
+                                    Ok(())
+                                })?;
+                            }
                             Some(expr) => {
-                                chain.push(AccessExpr::Dot(expr));
+                                self.push(&mut chain, AccessExpr::Dot(expr))?;
                             }
                             // If the expression is not a valid suffix, fall back to
                             // parsing as an identifier. This handles cases like `T.interval`
                             // where `interval` is a keyword but should be treated as an identifier.
                             None => {
-                                chain.push(AccessExpr::Dot(Expr::Identifier(
-                                    self.parse_identifier()?,
-                                )));
+                                let ident = self.parse_identifier()?;
+                                self.push(&mut chain, AccessExpr::Dot(Expr::Identifier(ident)))?;
                             }
                         }
                     }
@@ -2137,8 +2150,9 @@ impl<'a> Parser<'a> {
                 return self
                     .expected_ref("an identifier or a '*' after '.'", self.peek_token_ref());
             };
+            let idents = self.exprs_to_idents(root, chain)?;
             Ok(Expr::QualifiedWildcard(
-                ObjectName::from(self.exprs_to_idents(root, chain)?),
+                self.object_name(idents)?,
                 AttachedToken(wildcard_token),
             ))
         } else if self.maybe_parse_outer_join_operator() {
@@ -2150,7 +2164,7 @@ impl<'a> Parser<'a> {
             } else {
                 Expr::CompoundIdentifier(self.exprs_to_idents(root, chain)?)
             };
-            Ok(Expr::OuterJoin(expr.into()))
+            Ok(Expr::OuterJoin(self.boxed(expr)?))
         } else {
             self.build_compound_expr(root, chain)
         }
@@ -3862,7 +3876,7 @@ impl<'a> Parser<'a> {
             Token::Question => Some(BinaryOperator::Question),
             Token::QuestionAnd => Some(BinaryOperator::QuestionAnd),
             Token::QuestionPipe => Some(BinaryOperator::QuestionPipe),
-            Token::CustomBinaryOperator(s) => Some(BinaryOperator::Custom(s.clone())),
+            Token::CustomBinaryOperator(s) => Some(BinaryOperator::Custom(self.string(s)?)),
             Token::DoubleSharp if self.dialect.supports_geometric_types() => {
                 Some(BinaryOperator::DoubleHash)
             }
@@ -3926,10 +3940,11 @@ impl<'a> Parser<'a> {
                     // postgres so we can not use 'parse_object'
                     // or similar.
                     // See https://www.postgresql.org/docs/current/sql-createoperator.html
-                    let mut idents = vec![];
+                    let mut idents = Vec::new();
                     loop {
                         self.advance_token();
-                        idents.push(self.get_current_token().to_string());
+                        let ident = self.format(format_args!("{}", self.get_current_token()))?;
+                        self.push(&mut idents, ident)?;
                         if !self.consume_token(&Token::Period) {
                             break;
                         }
@@ -3987,51 +4002,55 @@ impl<'a> Parser<'a> {
 
                 Ok(match keyword {
                     Keyword::ALL => Expr::AllOp {
-                        left: Box::new(expr),
+                        left: self.boxed(expr)?,
                         compare_op: op,
-                        right: Box::new(right),
+                        right: self.boxed(right)?,
                     },
                     Keyword::ANY | Keyword::SOME => Expr::AnyOp {
-                        left: Box::new(expr),
+                        left: self.boxed(expr)?,
                         compare_op: op,
-                        right: Box::new(right),
+                        right: self.boxed(right)?,
                         is_some: keyword == Keyword::SOME,
                     },
                     unexpected_keyword => return Err(self.error(format_args!("Internal parser error: expected any of {{ALL, ANY, SOME}}, got {unexpected_keyword:?}"))),
                 })
             } else {
+                let right = self.parse_subexpr(precedence)?;
                 Ok(Expr::BinaryOp {
-                    left: Box::new(expr),
+                    left: self.boxed(expr)?,
                     op,
-                    right: Box::new(self.parse_subexpr(precedence)?),
+                    right: self.boxed(right)?,
                 })
             }
         } else if let Token::Word(w) = &tok.token {
             match w.keyword {
                 Keyword::IS => {
                     if self.parse_keyword(Keyword::NULL) {
-                        Ok(Expr::IsNull(Box::new(expr)))
+                        Ok(Expr::IsNull(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
-                        Ok(Expr::IsNotNull(Box::new(expr)))
+                        Ok(Expr::IsNotNull(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::TRUE]) {
-                        Ok(Expr::IsTrue(Box::new(expr)))
+                        Ok(Expr::IsTrue(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::NOT, Keyword::TRUE]) {
-                        Ok(Expr::IsNotTrue(Box::new(expr)))
+                        Ok(Expr::IsNotTrue(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::FALSE]) {
-                        Ok(Expr::IsFalse(Box::new(expr)))
+                        Ok(Expr::IsFalse(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::NOT, Keyword::FALSE]) {
-                        Ok(Expr::IsNotFalse(Box::new(expr)))
+                        Ok(Expr::IsNotFalse(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::UNKNOWN]) {
-                        Ok(Expr::IsUnknown(Box::new(expr)))
+                        Ok(Expr::IsUnknown(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::NOT, Keyword::UNKNOWN]) {
-                        Ok(Expr::IsNotUnknown(Box::new(expr)))
+                        Ok(Expr::IsNotUnknown(self.boxed(expr)?))
                     } else if self.parse_keywords(&[Keyword::DISTINCT, Keyword::FROM]) {
                         let expr2 = self.parse_expr()?;
-                        Ok(Expr::IsDistinctFrom(Box::new(expr), Box::new(expr2)))
+                        Ok(Expr::IsDistinctFrom(self.boxed(expr)?, self.boxed(expr2)?))
                     } else if self.parse_keywords(&[Keyword::NOT, Keyword::DISTINCT, Keyword::FROM])
                     {
                         let expr2 = self.parse_expr()?;
-                        Ok(Expr::IsNotDistinctFrom(Box::new(expr), Box::new(expr2)))
+                        Ok(Expr::IsNotDistinctFrom(
+                            self.boxed(expr)?,
+                            self.boxed(expr2)?,
+                        ))
                     } else if let Ok(is_normalized) = self.parse_unicode_is_normalized(expr) {
                         Ok(is_normalized)
                     } else {
@@ -4043,9 +4062,10 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::AT => {
                     self.expect_keywords(&[Keyword::TIME, Keyword::ZONE])?;
+                    let time_zone = self.parse_subexpr(precedence)?;
                     Ok(Expr::AtTimeZone {
-                        timestamp: Box::new(expr),
-                        time_zone: Box::new(self.parse_subexpr(precedence)?),
+                        timestamp: self.boxed(expr)?,
+                        time_zone: self.boxed(time_zone)?,
                     })
                 }
                 Keyword::NOT
@@ -4068,14 +4088,16 @@ impl<'a> Parser<'a> {
                     if regexp || rlike {
                         Ok(Expr::RLike {
                             negated,
-                            expr: Box::new(expr),
-                            pattern: Box::new(
-                                self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?,
-                            ),
+                            expr: self.boxed(expr)?,
+                            pattern: {
+                                let pattern =
+                                    self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?;
+                                self.boxed(pattern)?
+                            },
                             regexp,
                         })
                     } else if negated && null {
-                        Ok(Expr::IsNotNull(Box::new(expr)))
+                        Ok(Expr::IsNotNull(self.boxed(expr)?))
                     } else if self.parse_keyword(Keyword::IN) {
                         self.parse_in(expr, negated)
                     } else if self.parse_keyword(Keyword::BETWEEN) {
@@ -4084,29 +4106,35 @@ impl<'a> Parser<'a> {
                         Ok(Expr::Like {
                             negated,
                             any: self.parse_keyword(Keyword::ANY),
-                            expr: Box::new(expr),
-                            pattern: Box::new(
-                                self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?,
-                            ),
+                            expr: self.boxed(expr)?,
+                            pattern: {
+                                let pattern =
+                                    self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?;
+                                self.boxed(pattern)?
+                            },
                             escape_char: self.parse_escape_char()?,
                         })
                     } else if self.parse_keyword(Keyword::ILIKE) {
                         Ok(Expr::ILike {
                             negated,
                             any: self.parse_keyword(Keyword::ANY),
-                            expr: Box::new(expr),
-                            pattern: Box::new(
-                                self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?,
-                            ),
+                            expr: self.boxed(expr)?,
+                            pattern: {
+                                let pattern =
+                                    self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?;
+                                self.boxed(pattern)?
+                            },
                             escape_char: self.parse_escape_char()?,
                         })
                     } else if self.parse_keywords(&[Keyword::SIMILAR, Keyword::TO]) {
                         Ok(Expr::SimilarTo {
                             negated,
-                            expr: Box::new(expr),
-                            pattern: Box::new(
-                                self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?,
-                            ),
+                            expr: self.boxed(expr)?,
+                            pattern: {
+                                let pattern =
+                                    self.parse_subexpr(self.dialect.prec_value(Precedence::Like))?;
+                                self.boxed(pattern)?
+                            },
                             escape_char: self.parse_escape_char()?,
                         })
                     } else {
@@ -4114,7 +4142,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Keyword::NOTNULL if dialect.supports_notnull_operator() => {
-                    Ok(Expr::IsNotNull(Box::new(expr)))
+                    Ok(Expr::IsNotNull(self.boxed(expr)?))
                 }
                 Keyword::MEMBER => {
                     if self.parse_keyword(Keyword::OF) {
@@ -4122,8 +4150,8 @@ impl<'a> Parser<'a> {
                         let array = self.parse_expr()?;
                         self.expect_token(&Token::RParen)?;
                         Ok(Expr::MemberOf(MemberOf {
-                            value: Box::new(expr),
-                            array: Box::new(array),
+                            value: self.boxed(expr)?,
+                            array: self.boxed(array)?,
                         }))
                     } else {
                         self.expected_ref("OF after MEMBER", self.peek_token_ref())
@@ -4139,7 +4167,7 @@ impl<'a> Parser<'a> {
         } else if Token::DoubleColon == *tok {
             Ok(Expr::Cast {
                 kind: CastKind::DoubleColon,
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 data_type: self.parse_data_type()?,
                 array: false,
                 format: None,
@@ -4147,7 +4175,7 @@ impl<'a> Parser<'a> {
         } else if Token::ExclamationMark == *tok && self.dialect.supports_factorial_operator() {
             Ok(Expr::UnaryOp {
                 op: UnaryOperator::PGPostfixFactorial,
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
             })
         } else if Token::LBracket == *tok && self.dialect.supports_partiql()
             || (Token::Colon == *tok)
@@ -4264,7 +4292,7 @@ impl<'a> Parser<'a> {
     /// Parser is right after `[`
     fn parse_subscript(&mut self, chain: &mut Vec<AccessExpr>) -> Result<(), ParserError> {
         let subscript = self.parse_subscript_inner()?;
-        chain.push(AccessExpr::Subscript(subscript));
+        self.push(chain, AccessExpr::Subscript(subscript))?;
         Ok(())
     }
 
