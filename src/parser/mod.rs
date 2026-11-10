@@ -2208,20 +2208,23 @@ impl<'a> Parser<'a> {
                 return parser_err!(self, "expected function expression", root.span().start);
             };
 
-            let compound_func_name = [root]
-                .into_iter()
-                .chain(access_chain.into_iter().flat_map(|access| match access {
-                    AccessExpr::Dot(expr) => Some(expr),
-                    _ => None,
-                }))
-                .flat_map(|expr| match expr {
-                    Expr::Identifier(ident) => Some(ident),
-                    _ => None,
-                })
-                .map(ObjectNamePart::Identifier)
-                .chain(func.name.0)
-                .collect::<Vec<_>>();
-            func.name = ObjectName(compound_func_name);
+            let ObjectName(func_name) = core::mem::replace(&mut func.name, ObjectName(Vec::new()));
+            let mut compound_func_name = self.list();
+            compound_func_name.reserve_exact(1 + access_chain.len() + func_name.len())?;
+            if let Expr::Identifier(ident) = root {
+                compound_func_name.push(ObjectNamePart::Identifier(ident))?;
+            }
+            self.each(access_chain, |access| {
+                if let AccessExpr::Dot(Expr::Identifier(ident)) = access {
+                    compound_func_name.push(ObjectNamePart::Identifier(ident))?;
+                }
+                Ok(())
+            })?;
+            self.each(func_name, |part| {
+                compound_func_name.push(part)?;
+                Ok(())
+            })?;
+            func.name = ObjectName(self.keep(compound_func_name));
 
             return Ok(Expr::Function(func));
         }
@@ -2245,20 +2248,28 @@ impl<'a> Parser<'a> {
             };
 
             let token_start = root.span().start;
-            let mut idents = self.exprs_to_idents(root, vec![])?;
-            match *inner_expr {
-                Expr::CompoundIdentifier(suffix) => idents.extend(suffix),
-                Expr::Identifier(suffix) => idents.push(suffix),
+            let mut idents = self.exprs_to_idents(root, Vec::new())?;
+            match self.unboxed(inner_expr) {
+                Expr::CompoundIdentifier(suffix) => {
+                    self.grow(&mut idents, suffix.len())?;
+                    self.each(suffix, |ident| {
+                        idents.push(ident);
+                        Ok(())
+                    })?;
+                }
+                Expr::Identifier(suffix) => self.push(&mut idents, suffix)?,
                 _ => {
                     return parser_err!(self, "column identifier before (+)", token_start);
                 }
             }
 
-            return Ok(Expr::OuterJoin(Expr::CompoundIdentifier(idents).into()));
+            return Ok(Expr::OuterJoin(
+                self.boxed(Expr::CompoundIdentifier(idents))?,
+            ));
         }
 
         Ok(Expr::CompoundFieldAccess {
-            root: Box::new(root),
+            root: self.boxed(root)?,
             access_chain,
         })
     }
@@ -2288,21 +2299,23 @@ impl<'a> Parser<'a> {
         root: Expr,
         fields: Vec<AccessExpr>,
     ) -> Result<Vec<Ident>, ParserError> {
-        let mut idents = vec![];
         if let Expr::Identifier(root) = root {
-            idents.push(root);
-            for x in fields {
+            let mut idents = self.list();
+            idents.reserve_exact(1 + fields.len())?;
+            idents.push(root)?;
+            self.each(fields, |x| {
                 if let AccessExpr::Dot(Expr::Identifier(ident)) = x {
-                    idents.push(ident);
+                    idents.push(ident)?;
+                    Ok(())
                 } else {
-                    return parser_err!(
+                    parser_err!(
                         self,
                         format_args!("Expected identifier, found: {}", x),
                         x.span().start
-                    );
+                    )
                 }
-            }
-            Ok(idents)
+            })?;
+            Ok(self.keep(idents))
         } else {
             parser_err!(
                 self,
@@ -4872,6 +4885,18 @@ impl<'a> Parser<'a> {
         } else {
             Err(self.expected_args(format_args!("{expected}"), self.peek_token_ref()))
         }
+    }
+
+    /// A number's text, as the value keeps it.
+    #[cfg(not(feature = "bigdecimal"))]
+    fn number(&self, text: &str, _loc: Location) -> Result<String, ParserError> {
+        self.string(text)
+    }
+
+    /// A number's text, as the value keeps it.
+    #[cfg(feature = "bigdecimal")]
+    fn number(&self, text: &str, loc: Location) -> Result<bigdecimal::BigDecimal, ParserError> {
+        self.parse(text, loc)
     }
 
     fn parse<T: FromStr>(&self, s: &str, loc: Location) -> Result<T, ParserError>
@@ -12059,10 +12084,11 @@ impl<'a> Parser<'a> {
 
     /// Parse a literal value (numbers, strings, date/time, booleans)
     pub fn parse_value(&mut self) -> Result<ValueWithSpan, ParserError> {
-        let next_token = self.next_token();
+        self.advance_token();
+        let next_token = self.get_current_token();
         let span = next_token.span;
         let ok_value = |value: Value| Ok(value.with_span(span));
-        match next_token.token {
+        match &next_token.token {
             Token::Word(w) => match w.keyword {
                 Keyword::TRUE if self.dialect.supports_boolean_literals() => {
                     ok_value(Value::Boolean(true))
@@ -12072,83 +12098,87 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::NULL => ok_value(Value::Null),
                 Keyword::NoKeyword if w.quote_style.is_some() => match w.quote_style {
-                    Some('"') => ok_value(Value::DoubleQuotedString(w.value)),
-                    Some('\'') => ok_value(Value::SingleQuotedString(w.value)),
-                    _ => self.expected(
-                        "A value?",
-                        TokenWithSpan {
-                            token: Token::Word(w),
-                            span,
-                        },
-                    )?,
+                    Some('"') => ok_value(Value::DoubleQuotedString(self.string(&w.value)?)),
+                    Some('\'') => ok_value(Value::SingleQuotedString(self.string(&w.value)?)),
+                    _ => self.expected_ref("A value?", next_token)?,
                 },
-                _ => self.expected(
-                    "a concrete value",
-                    TokenWithSpan {
-                        token: Token::Word(w),
-                        span,
-                    },
-                ),
+                _ => self.expected_ref("a concrete value", next_token),
             },
-            // The call to n.parse() returns a bigdecimal when the
-            // bigdecimal feature is enabled, and is otherwise a no-op
-            // (i.e., it returns the input string).
-            Token::Number(n, l) => ok_value(Value::Number(self.parse(&n, span.start)?, l)),
-            Token::SingleQuotedString(ref s) => ok_value(Value::SingleQuotedString(
-                self.maybe_concat_string_literal(s.to_string()),
-            )),
-            Token::DoubleQuotedString(ref s) => ok_value(Value::DoubleQuotedString(
-                self.maybe_concat_string_literal(s.to_string()),
-            )),
-            Token::TripleSingleQuotedString(ref s) => {
-                ok_value(Value::TripleSingleQuotedString(s.to_string()))
+            Token::Number(n, l) => ok_value(Value::Number(self.number(n, span.start)?, *l)),
+            Token::SingleQuotedString(s) => {
+                let s = self.string(s)?;
+                ok_value(Value::SingleQuotedString(
+                    self.maybe_concat_string_literal(s)?,
+                ))
             }
-            Token::TripleDoubleQuotedString(ref s) => {
-                ok_value(Value::TripleDoubleQuotedString(s.to_string()))
+            Token::DoubleQuotedString(s) => {
+                let s = self.string(s)?;
+                ok_value(Value::DoubleQuotedString(
+                    self.maybe_concat_string_literal(s)?,
+                ))
             }
-            Token::DollarQuotedString(ref s) => ok_value(Value::DollarQuotedString(s.clone())),
-            Token::SingleQuotedByteStringLiteral(ref s) => {
-                ok_value(Value::SingleQuotedByteStringLiteral(s.clone()))
+            Token::TripleSingleQuotedString(s) => {
+                ok_value(Value::TripleSingleQuotedString(self.string(s)?))
             }
-            Token::DoubleQuotedByteStringLiteral(ref s) => {
-                ok_value(Value::DoubleQuotedByteStringLiteral(s.clone()))
+            Token::TripleDoubleQuotedString(s) => {
+                ok_value(Value::TripleDoubleQuotedString(self.string(s)?))
             }
-            Token::TripleSingleQuotedByteStringLiteral(ref s) => {
-                ok_value(Value::TripleSingleQuotedByteStringLiteral(s.clone()))
+            Token::DollarQuotedString(s) => {
+                ok_value(Value::DollarQuotedString(DollarQuotedString {
+                    value: self.string(&s.value)?,
+                    tag: match &s.tag {
+                        Some(tag) => Some(self.string(tag)?),
+                        None => None,
+                    },
+                }))
             }
-            Token::TripleDoubleQuotedByteStringLiteral(ref s) => {
-                ok_value(Value::TripleDoubleQuotedByteStringLiteral(s.clone()))
+            Token::SingleQuotedByteStringLiteral(s) => {
+                ok_value(Value::SingleQuotedByteStringLiteral(self.string(s)?))
             }
-            Token::SingleQuotedRawStringLiteral(ref s) => {
-                ok_value(Value::SingleQuotedRawStringLiteral(s.clone()))
+            Token::DoubleQuotedByteStringLiteral(s) => {
+                ok_value(Value::DoubleQuotedByteStringLiteral(self.string(s)?))
             }
-            Token::DoubleQuotedRawStringLiteral(ref s) => {
-                ok_value(Value::DoubleQuotedRawStringLiteral(s.clone()))
+            Token::TripleSingleQuotedByteStringLiteral(s) => {
+                ok_value(Value::TripleSingleQuotedByteStringLiteral(self.string(s)?))
             }
-            Token::TripleSingleQuotedRawStringLiteral(ref s) => {
-                ok_value(Value::TripleSingleQuotedRawStringLiteral(s.clone()))
+            Token::TripleDoubleQuotedByteStringLiteral(s) => {
+                ok_value(Value::TripleDoubleQuotedByteStringLiteral(self.string(s)?))
             }
-            Token::TripleDoubleQuotedRawStringLiteral(ref s) => {
-                ok_value(Value::TripleDoubleQuotedRawStringLiteral(s.clone()))
+            Token::SingleQuotedRawStringLiteral(s) => {
+                ok_value(Value::SingleQuotedRawStringLiteral(self.string(s)?))
             }
-            Token::NationalStringLiteral(ref s) => {
-                ok_value(Value::NationalStringLiteral(s.to_string()))
+            Token::DoubleQuotedRawStringLiteral(s) => {
+                ok_value(Value::DoubleQuotedRawStringLiteral(self.string(s)?))
+            }
+            Token::TripleSingleQuotedRawStringLiteral(s) => {
+                ok_value(Value::TripleSingleQuotedRawStringLiteral(self.string(s)?))
+            }
+            Token::TripleDoubleQuotedRawStringLiteral(s) => {
+                ok_value(Value::TripleDoubleQuotedRawStringLiteral(self.string(s)?))
+            }
+            Token::NationalStringLiteral(s) => {
+                ok_value(Value::NationalStringLiteral(self.string(s)?))
             }
             Token::QuoteDelimitedStringLiteral(v) => {
-                ok_value(Value::QuoteDelimitedStringLiteral(v))
+                ok_value(Value::QuoteDelimitedStringLiteral(self.quote_delimited(v)?))
             }
-            Token::NationalQuoteDelimitedStringLiteral(v) => {
-                ok_value(Value::NationalQuoteDelimitedStringLiteral(v))
+            Token::NationalQuoteDelimitedStringLiteral(v) => ok_value(
+                Value::NationalQuoteDelimitedStringLiteral(self.quote_delimited(v)?),
+            ),
+            Token::EscapedStringLiteral(s) => {
+                ok_value(Value::EscapedStringLiteral(self.string(s)?))
             }
-            Token::EscapedStringLiteral(ref s) => {
-                ok_value(Value::EscapedStringLiteral(s.to_string()))
+            Token::UnicodeStringLiteral(s) => {
+                ok_value(Value::UnicodeStringLiteral(self.string(s)?))
             }
-            Token::UnicodeStringLiteral(ref s) => {
-                ok_value(Value::UnicodeStringLiteral(s.to_string()))
-            }
-            Token::HexStringLiteral(ref s) => ok_value(Value::HexStringLiteral(s.to_string())),
-            Token::Placeholder(ref s) => ok_value(Value::Placeholder(s.to_string())),
-            tok @ Token::Colon | tok @ Token::AtSign => {
+            Token::HexStringLiteral(s) => ok_value(Value::HexStringLiteral(self.string(s)?)),
+            Token::Placeholder(s) => ok_value(Value::Placeholder(self.string(s)?)),
+            Token::Colon | Token::AtSign => {
+                let tok = if next_token.token == Token::Colon {
+                    ':'
+                } else {
+                    '@'
+                };
                 // 1. Not calling self.parse_identifier(false)?
                 //    because only in placeholder we want to check
                 //    numbers as idfentifies.  This because snowflake
@@ -12156,30 +12186,28 @@ impl<'a> Parser<'a> {
                 // 2. Not calling self.next_token() to enforce `tok`
                 //    be followed immediately by a word/number, ie.
                 //    without any whitespace in between
-                let next_token = self.next_token_no_skip().unwrap_or(&EOF_TOKEN).clone();
-                let ident = match next_token.token {
-                    Token::Word(w) => Ok(w.into_ident(next_token.span)),
-                    Token::Number(w, false) => Ok(Ident::with_span(next_token.span, w)),
-                    _ => self.expected("placeholder", next_token),
-                }?;
-                Ok(Value::Placeholder(format!("{tok}{}", ident.value))
-                    .with_span(Span::new(span.start, ident.span.end)))
+                self.next_token_no_skip();
+                let next_token = self.get_current_token();
+                let name = match &next_token.token {
+                    Token::Word(w) => &w.value,
+                    Token::Number(w, false) => w,
+                    _ => return self.expected_ref("placeholder", next_token),
+                };
+                Ok(
+                    Value::Placeholder(self.format(format_args!("{tok}{name}"))?)
+                        .with_span(Span::new(span.start, next_token.span.end)),
+                )
             }
-            unexpected => self.expected(
-                "a value",
-                TokenWithSpan {
-                    token: unexpected,
-                    span,
-                },
-            ),
+            _ => self.expected_ref("a value", next_token),
         }
     }
 
-    fn maybe_concat_string_literal(&mut self, mut str: String) -> String {
+    fn maybe_concat_string_literal(&mut self, mut str: String) -> Result<String, ParserError> {
         if self.dialect.supports_string_literal_concatenation() {
             while let Token::SingleQuotedString(ref s) | Token::DoubleQuotedString(ref s) =
                 self.peek_token_ref().token
             {
+                self.grow(&mut str, s.len())?;
                 str.push_str(s);
                 self.advance_token();
             }
@@ -12191,7 +12219,7 @@ impl<'a> Parser<'a> {
             // string literals separated by newlines so we can concatenate them.
             let mut after_newline = false;
             loop {
-                match self.peek_token_no_skip().token {
+                match &self.peek_nth_token_no_skip_ref(0).token {
                     Token::Whitespace(Whitespace::Newline) => {
                         after_newline = true;
                         self.next_token_no_skip();
@@ -12199,10 +12227,11 @@ impl<'a> Parser<'a> {
                     Token::Whitespace(_) => {
                         self.next_token_no_skip();
                     }
-                    Token::SingleQuotedString(ref s) | Token::DoubleQuotedString(ref s)
+                    Token::SingleQuotedString(s) | Token::DoubleQuotedString(s)
                         if after_newline =>
                     {
-                        str.push_str(s.clone().as_str());
+                        self.grow(&mut str, s.len())?;
+                        str.push_str(s);
                         self.next_token_no_skip();
                         after_newline = false;
                     }
@@ -12211,7 +12240,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        str
+        Ok(str)
     }
 
     /// Parse an unsigned numeric literal
@@ -12230,21 +12259,20 @@ impl<'a> Parser<'a> {
     /// Parse a numeric literal as an expression. Returns a [`Expr::UnaryOp`] if the number is signed,
     /// otherwise returns a [`Expr::Value`]
     pub fn parse_number(&mut self) -> Result<Expr, ParserError> {
-        let next_token = self.next_token();
-        match next_token.token {
-            Token::Plus => Ok(Expr::UnaryOp {
-                op: UnaryOperator::Plus,
-                expr: Box::new(Expr::Value(self.parse_number_value()?)),
-            }),
-            Token::Minus => Ok(Expr::UnaryOp {
-                op: UnaryOperator::Minus,
-                expr: Box::new(Expr::Value(self.parse_number_value()?)),
-            }),
+        self.advance_token();
+        let op = match self.get_current_token().token {
+            Token::Plus => UnaryOperator::Plus,
+            Token::Minus => UnaryOperator::Minus,
             _ => {
                 self.prev_token();
-                Ok(Expr::Value(self.parse_number_value()?))
+                return Ok(Expr::Value(self.parse_number_value()?));
             }
-        }
+        };
+        let value = self.parse_number_value()?;
+        Ok(Expr::UnaryOp {
+            op,
+            expr: self.boxed(Expr::Value(value))?,
+        })
     }
 
     fn parse_introduced_string_expr(&mut self) -> Result<Expr, ParserError> {
