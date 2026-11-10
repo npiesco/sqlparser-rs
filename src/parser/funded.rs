@@ -25,7 +25,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use core::fmt;
 
 use super::{Parser, ParserError};
-use crate::ast::{DollarQuotedString, Ident, QuoteDelimitedString};
+use crate::ast::{DollarQuotedString, Ident, ObjectName, ObjectNamePart, QuoteDelimitedString};
 use crate::funding::{Buffer, Funding, Held};
 use crate::tokenizer::{
     Span, Token, TokenWithSpan, TokenizerError, TokenizerErrorKind, TokenizerFunding, Whitespace,
@@ -101,6 +101,65 @@ impl<'a> Parser<'a> {
         self.grow(kept, 1)?;
         kept.push(item);
         Ok(())
+    }
+
+    /// Each of the items of `list` (a list handed out) handed to `each` in turn, stopping at the
+    /// first that fails; the list's own block, freed then, is given back.
+    pub(crate) fn each<T>(
+        &self,
+        list: Vec<T>,
+        each: impl FnMut(T) -> Result<(), ParserError>,
+    ) -> Result<(), ParserError> {
+        let room = list.room() * <Vec<T> as Buffer>::ITEM;
+        let made = list.into_iter().try_for_each(each);
+        self.kept.set(self.kept.get() - room);
+        self.funding.discharge(room);
+        made
+    }
+
+    /// `kept`, a buffer handed out, freed: its room is given back. What its items hold is not.
+    pub(crate) fn released<B: Buffer>(&self, kept: B) {
+        let room = kept.room() * B::ITEM;
+        drop(kept);
+        self.kept.set(self.kept.get() - room);
+        self.funding.discharge(room);
+    }
+
+    /// The only item of `list` (a list handed out), the list itself freed and given back.
+    pub(crate) fn only<T>(&self, mut list: Vec<T>) -> Option<T> {
+        let item = list.pop();
+        self.released(list);
+        item
+    }
+
+    /// `error`, made and handed out, freed: what it held is given back.
+    pub(crate) fn discarded(&self, error: ParserError) {
+        let held = error.held();
+        drop(error);
+        self.kept.set(self.kept.get() - held);
+        self.funding.discharge(held);
+    }
+
+    /// The value `boxed` holds, moved out of its block: the block, freed, is given back.
+    pub(crate) fn unboxed<T>(&self, boxed: Box<T>) -> T {
+        let value = *boxed;
+        let size = core::mem::size_of::<T>();
+        self.kept.set(self.kept.get() - size);
+        self.funding.discharge(size);
+        value
+    }
+
+    /// The name `idents` (a list handed out) make, in a list of its own: the list of `idents`,
+    /// freed, is given back.
+    pub(crate) fn object_name(&self, idents: Vec<Ident>) -> Result<ObjectName, ParserError> {
+        let mut parts = self.list();
+        parts.reserve_exact(idents.len())?;
+        self.each(idents, |ident| {
+            parts
+                .push(ObjectNamePart::Identifier(ident))
+                .map_err(ParserError::from)
+        })?;
+        Ok(ObjectName(self.keep(parts)))
     }
 
     /// `value` in a block of its own, handed out.
