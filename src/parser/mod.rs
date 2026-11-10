@@ -5118,7 +5118,10 @@ impl<'a> Parser<'a> {
             return Ok(vec![]);
         }
 
-        if self.options.trailing_commas && self.peek_tokens() == [Token::Comma, end_token] {
+        if self.options.trailing_commas
+            && self.peek_nth_token_ref(0).token == Token::Comma
+            && self.peek_nth_token_ref(1).token == end_token
+        {
             let _ = self.consume_token(&Token::Comma);
             return Ok(vec![]);
         }
@@ -6749,10 +6752,10 @@ impl<'a> Parser<'a> {
                     Keyword::MERGE => CreateViewAlgorithm::Merge,
                     Keyword::TEMPTABLE => CreateViewAlgorithm::TempTable,
                     _ => {
-                        self.prev_token();
-                        let found = self.next_token();
-                        return self
-                            .expected("UNDEFINED or MERGE or TEMPTABLE after ALGORITHM =", found);
+                        return self.expected_ref(
+                            "UNDEFINED or MERGE or TEMPTABLE after ALGORITHM =",
+                            self.get_current_token(),
+                        );
                     }
                 },
             )
@@ -6771,9 +6774,10 @@ impl<'a> Parser<'a> {
                     Keyword::DEFINER => CreateViewSecurity::Definer,
                     Keyword::INVOKER => CreateViewSecurity::Invoker,
                     _ => {
-                        self.prev_token();
-                        let found = self.next_token();
-                        return self.expected("DEFINER or INVOKER after SQL SECURITY", found);
+                        return self.expected_ref(
+                            "DEFINER or INVOKER after SQL SECURITY",
+                            self.get_current_token(),
+                        );
                     }
                 },
             )
@@ -9196,13 +9200,13 @@ impl<'a> Parser<'a> {
 
     /// Parse comment value.
     pub fn parse_comment_value(&mut self) -> Result<String, ParserError> {
-        let next_token = self.next_token();
-        let value = match next_token.token {
-            Token::SingleQuotedString(str) => str,
-            Token::DollarQuotedString(str) => str.value,
-            _ => self.expected("string literal", next_token)?,
-        };
-        Ok(value)
+        self.advance_token();
+        let next_token = self.get_current_token();
+        match &next_token.token {
+            Token::SingleQuotedString(str) => self.string(str),
+            Token::DollarQuotedString(str) => self.string(&str.value),
+            _ => self.expected_ref("string literal", next_token),
+        }
     }
 
     /// Parse optional procedure parameters.
@@ -13572,7 +13576,7 @@ impl<'a> Parser<'a> {
     fn parse_view_columns(&mut self) -> Result<Vec<ViewColumnDef>, ParserError> {
         if self.consume_token(&Token::LParen) {
             if self.peek_token_ref().token == Token::RParen {
-                self.next_token();
+                self.advance_token();
                 Ok(vec![])
             } else {
                 let cols = self.parse_comma_separated_with_trailing_commas(
@@ -13609,7 +13613,7 @@ impl<'a> Parser<'a> {
         loop {
             let option = self.parse_optional_column_option()?;
             if let Some(option) = option {
-                options.push(option);
+                self.push(&mut options, option)?;
             } else {
                 break;
             }
