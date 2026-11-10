@@ -386,7 +386,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn quote_delimited(
+    pub(crate) fn quote_delimited(
         &self,
         quoted: &QuoteDelimitedString,
     ) -> Result<QuoteDelimitedString, ParserError> {
