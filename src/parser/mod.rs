@@ -461,7 +461,17 @@ impl<'a> Parser<'a> {
     /// # }
     /// ```
     pub fn parse_statements(&mut self) -> Result<Vec<Statement>, ParserError> {
-        let mut stmts = Vec::new();
+        let before = self.kept.get();
+        let parsed = self.parse_statements_within();
+        if let Err(error) = &parsed {
+            // All the statements made before it failed were freed with it, but the error.
+            self.unwound(before, error);
+        }
+        parsed
+    }
+
+    fn parse_statements_within(&mut self) -> Result<Vec<Statement>, ParserError> {
+        let mut stmts = self.list();
         let mut expecting_statement_delimiter = false;
         loop {
             // ignore empty statements (between successive statement delimiters)
@@ -490,10 +500,10 @@ impl<'a> Parser<'a> {
             }
 
             let statement = self.parse_statement()?;
-            stmts.push(statement);
+            stmts.push(statement)?;
             expecting_statement_delimiter = true;
         }
-        Ok(stmts)
+        Ok(self.keep(stmts))
     }
 
     /// Convenience method to parse a string with one or more SQL
@@ -565,9 +575,13 @@ impl<'a> Parser<'a> {
             return statement;
         }
 
-        let next_token = self.next_token();
-        match &next_token.token {
-            Token::Word(w) => match w.keyword {
+        self.advance_token();
+        let keyword = match &self.get_current_token().token {
+            Token::Word(w) => Some(w.keyword),
+            _ => None,
+        };
+        match keyword {
+            Some(keyword) => match keyword {
                 Keyword::KILL => self.parse_kill(),
                 Keyword::FLUSH => self.parse_flush(),
                 Keyword::DESC => self.parse_explain(DescribeAlias::Desc),
@@ -612,11 +626,23 @@ impl<'a> Parser<'a> {
                 Keyword::DISCARD => self.parse_discard(),
                 Keyword::DECLARE => self.parse_declare(),
                 Keyword::FETCH => self.parse_fetch_statement(),
-                Keyword::DELETE => self.parse_delete(next_token),
-                Keyword::INSERT => self.parse_insert(next_token),
-                Keyword::REPLACE => self.parse_replace(next_token),
+                Keyword::DELETE => {
+                    let token = self.copied(self.get_current_token())?;
+                    self.parse_delete(token)
+                }
+                Keyword::INSERT => {
+                    let token = self.copied(self.get_current_token())?;
+                    self.parse_insert(token)
+                }
+                Keyword::REPLACE => {
+                    let token = self.copied(self.get_current_token())?;
+                    self.parse_replace(token)
+                }
                 Keyword::UNCACHE => self.parse_uncache_table(),
-                Keyword::UPDATE => self.parse_update(next_token),
+                Keyword::UPDATE => {
+                    let token = self.copied(self.get_current_token())?;
+                    self.parse_update(token)
+                }
                 Keyword::ALTER => self.parse_alter(),
                 Keyword::CALL => self.parse_call(),
                 Keyword::COPY => self.parse_copy(),
@@ -652,7 +678,10 @@ impl<'a> Parser<'a> {
                 Keyword::DEALLOCATE => self.parse_deallocate(),
                 Keyword::EXECUTE | Keyword::EXEC => self.parse_execute(),
                 Keyword::PREPARE => self.parse_prepare(),
-                Keyword::MERGE => self.parse_merge(next_token).map(Into::into),
+                Keyword::MERGE => {
+                    let token = self.copied(self.get_current_token())?;
+                    self.parse_merge(token).map(Into::into)
+                }
                 // `LISTEN`, `UNLISTEN` and `NOTIFY` are Postgres-specific
                 // syntaxes. They are used for Postgres statement.
                 Keyword::LISTEN if self.dialect.supports_listen_notify() => self.parse_listen(),
@@ -690,13 +719,13 @@ impl<'a> Parser<'a> {
                     self.parse_vacuum()
                 }
                 Keyword::RESET => self.parse_reset().map(Into::into),
-                _ => self.expected("an SQL statement", next_token),
+                _ => self.expected_ref("an SQL statement", self.get_current_token()),
             },
-            Token::LParen => {
+            None if self.get_current_token().token == Token::LParen => {
                 self.prev_token();
                 self.parse_query().map(Into::into)
             }
-            _ => self.expected("an SQL statement", next_token),
+            None => self.expected_ref("an SQL statement", self.get_current_token()),
         }
     }
 
