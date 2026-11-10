@@ -11756,7 +11756,7 @@ impl<'a> Parser<'a> {
         let values =
             if matches!(target, CopyTarget::Stdin) && self.peek_token_ref().token != Token::EOF {
                 self.expect_token(&Token::SemiColon)?;
-                self.parse_tsv()
+                self.parse_tsv()?
             } else {
                 vec![]
             };
@@ -12104,43 +12104,48 @@ impl<'a> Parser<'a> {
                 .map_or(Location { line: 0, column: 0 }, |t| t.span.start);
             return parser_err!(self, format_args!("Expect a char, found {s:?}"), loc);
         }
-        Ok(s.chars().next().unwrap())
+        let char = s.chars().next().unwrap();
+        self.released(s);
+        Ok(char)
     }
 
     /// Parse a tab separated values in
     /// COPY payload
-    pub fn parse_tsv(&mut self) -> Vec<Option<String>> {
+    pub fn parse_tsv(&mut self) -> Result<Vec<Option<String>>, ParserError> {
         self.parse_tab_value()
     }
 
     /// Parse a single tab-separated value row used by `COPY` payload parsing.
-    pub fn parse_tab_value(&mut self) -> Vec<Option<String>> {
+    pub fn parse_tab_value(&mut self) -> Result<Vec<Option<String>>, ParserError> {
         let mut values = vec![];
         let mut content = String::new();
-        while let Some(t) = self.next_token_no_skip().map(|t| &t.token) {
+        while self.next_token_no_skip().is_some() {
+            let t = &self.get_current_token().token;
             match t {
-                Token::Whitespace(Whitespace::Tab) => {
-                    values.push(Some(core::mem::take(&mut content)));
-                }
-                Token::Whitespace(Whitespace::Newline) => {
-                    values.push(Some(core::mem::take(&mut content)));
+                Token::Whitespace(Whitespace::Tab) | Token::Whitespace(Whitespace::Newline) => {
+                    let value = core::mem::take(&mut content);
+                    self.push(&mut values, Some(value))?;
                 }
                 Token::Backslash => {
                     if self.consume_token(&Token::Period) {
-                        return values;
+                        self.released(content);
+                        return Ok(values);
                     }
-                    if let Token::Word(w) = self.next_token().token {
-                        if w.value == "N" {
-                            values.push(None);
-                        }
+                    self.advance_token();
+                    if matches!(&self.get_current_token().token, Token::Word(w) if w.value == "N") {
+                        self.push(&mut values, None)?;
                     }
                 }
                 _ => {
-                    content.push_str(&t.to_string());
+                    let piece = self.format(format_args!("{t}"))?;
+                    self.grow(&mut content, piece.len())?;
+                    content.push_str(&piece);
+                    self.released(piece);
                 }
             }
         }
-        values
+        self.released(content);
+        Ok(values)
     }
 
     /// Parse a literal value (numbers, strings, date/time, booleans)
@@ -12337,34 +12342,30 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_introduced_string_expr(&mut self) -> Result<Expr, ParserError> {
-        let next_token = self.next_token();
+        self.advance_token();
+        let next_token = self.get_current_token();
         let span = next_token.span;
-        match next_token.token {
-            Token::SingleQuotedString(ref s) => Ok(Expr::Value(
-                Value::SingleQuotedString(s.to_string()).with_span(span),
+        match &next_token.token {
+            Token::SingleQuotedString(s) => Ok(Expr::Value(
+                Value::SingleQuotedString(self.string(s)?).with_span(span),
             )),
-            Token::DoubleQuotedString(ref s) => Ok(Expr::Value(
-                Value::DoubleQuotedString(s.to_string()).with_span(span),
+            Token::DoubleQuotedString(s) => Ok(Expr::Value(
+                Value::DoubleQuotedString(self.string(s)?).with_span(span),
             )),
-            Token::HexStringLiteral(ref s) => Ok(Expr::Value(
-                Value::HexStringLiteral(s.to_string()).with_span(span),
+            Token::HexStringLiteral(s) => Ok(Expr::Value(
+                Value::HexStringLiteral(self.string(s)?).with_span(span),
             )),
-            unexpected => self.expected(
-                "a string value",
-                TokenWithSpan {
-                    token: unexpected,
-                    span,
-                },
-            ),
+            _ => self.expected_ref("a string value", next_token),
         }
     }
 
     /// Parse an unsigned literal integer/long
     pub fn parse_literal_uint(&mut self) -> Result<u64, ParserError> {
-        let next_token = self.next_token();
-        match next_token.token {
-            Token::Number(s, _) => self.parse::<u64>(&s, next_token.span.start),
-            _ => self.expected("literal int", next_token),
+        self.advance_token();
+        let next_token = self.get_current_token();
+        match &next_token.token {
+            Token::Number(s, _) => self.parse::<u64>(s, next_token.span.start),
+            _ => self.expected_ref("literal int", next_token),
         }
     }
 
@@ -12372,12 +12373,19 @@ impl<'a> Parser<'a> {
     /// e.g. `CREATE FUNCTION ... AS $$ body $$`.
     fn parse_create_function_body_string(&mut self) -> Result<CreateFunctionBody, ParserError> {
         let parse_string_expr = |parser: &mut Parser| -> Result<Expr, ParserError> {
-            let peek_token = parser.peek_token();
+            let peek_token = parser.peek_token_ref();
             let span = peek_token.span;
-            match peek_token.token {
+            match &peek_token.token {
                 Token::DollarQuotedString(s) if dialect_of!(parser is PostgreSqlDialect | GenericDialect) =>
                 {
-                    parser.next_token();
+                    let s = DollarQuotedString {
+                        value: parser.string(&s.value)?,
+                        tag: match &s.tag {
+                            Some(tag) => Some(parser.string(tag)?),
+                            None => None,
+                        },
+                    };
+                    parser.advance_token();
                     Ok(Expr::Value(Value::DollarQuotedString(s).with_span(span)))
                 }
                 _ => Ok(Expr::Value(
@@ -12398,20 +12406,21 @@ impl<'a> Parser<'a> {
 
     /// Parse a literal string
     pub fn parse_literal_string(&mut self) -> Result<String, ParserError> {
-        let next_token = self.next_token();
-        match next_token.token {
+        self.advance_token();
+        let next_token = self.get_current_token();
+        match &next_token.token {
             Token::Word(Word {
                 value,
                 keyword: Keyword::NoKeyword,
                 ..
-            }) => Ok(value),
-            Token::SingleQuotedString(s) => Ok(s),
-            Token::DoubleQuotedString(s) => Ok(s),
+            }) => self.string(value),
+            Token::SingleQuotedString(s) => self.string(s),
+            Token::DoubleQuotedString(s) => self.string(s),
             Token::EscapedStringLiteral(s) if dialect_of!(self is PostgreSqlDialect | GenericDialect) => {
-                Ok(s)
+                self.string(s)
             }
-            Token::UnicodeStringLiteral(s) => Ok(s),
-            _ => self.expected("literal string", next_token),
+            Token::UnicodeStringLiteral(s) => self.string(s),
+            _ => self.expected_ref("literal string", next_token),
         }
     }
 
@@ -12443,7 +12452,7 @@ impl<'a> Parser<'a> {
         })?;
         if self.parse_keyword(Keyword::NORMALIZED) {
             return Ok(Expr::IsNormalized {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 form: normalized_form,
                 negated: neg,
             });
@@ -12945,16 +12954,17 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::LParen)?;
         let mut values = Vec::new();
         loop {
-            let next_token = self.next_token();
-            match next_token.token {
-                Token::SingleQuotedString(value) => values.push(value),
-                _ => self.expected("a string", next_token)?,
-            }
-            let next_token = self.next_token();
-            match next_token.token {
+            self.advance_token();
+            let value = match &self.get_current_token().token {
+                Token::SingleQuotedString(value) => self.string(value)?,
+                _ => return self.expected_at("a string", self.get_current_index()),
+            };
+            self.push(&mut values, value)?;
+            self.advance_token();
+            match &self.get_current_token().token {
                 Token::Comma => (),
                 Token::RParen => break,
-                _ => self.expected(", or }", next_token)?,
+                _ => return self.expected_at(", or }", self.get_current_index()),
             }
         }
         Ok(values)
@@ -12982,7 +12992,7 @@ impl<'a> Parser<'a> {
             parser.expect_token(&Token::LParen)?;
             let query = parser.parse_query()?;
             parser.expect_token(&Token::RParen)?;
-            Ok(*query)
+            Ok(parser.unboxed(query))
         })
     }
 
@@ -13094,12 +13104,13 @@ impl<'a> Parser<'a> {
                 vec![]
             };
             self.expect_token(&Token::RParen)?;
-            hints.push(TableIndexHints {
+            let hint = TableIndexHints {
                 hint_type,
                 index_type,
                 for_clause,
                 index_names,
-            });
+            };
+            self.push(&mut hints, hint)?;
         }
         Ok(hints)
     }
