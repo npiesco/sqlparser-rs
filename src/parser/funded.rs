@@ -181,6 +181,20 @@ impl<'a> Parser<'a> {
         Ok(self.keep(made))
     }
 
+    /// `args` written onto the end of `kept`, a text handed out: the room it grows by is charged
+    /// before it is allocated.
+    pub(crate) fn append(
+        &self,
+        kept: &mut String,
+        args: fmt::Arguments<'_>,
+    ) -> Result<(), ParserError> {
+        let mut measure = crate::funding::Measure(0);
+        fmt::write(&mut measure, args).map_err(|_| ParserError::OutOfMemory { needed: 0 })?;
+        self.grow(kept, measure.0)?;
+        // Within the room it has, writing reallocates nothing.
+        fmt::write(kept, args).map_err(|_| ParserError::OutOfMemory { needed: measure.0 })
+    }
+
     /// The syntax error `message`, the message charged before it is made: out of memory if that
     /// is refused.
     pub(crate) fn error(&self, message: fmt::Arguments<'_>) -> ParserError {

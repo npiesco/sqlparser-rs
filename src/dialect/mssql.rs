@@ -25,7 +25,7 @@ use crate::keywords::Keyword;
 use crate::parser::{Parser, ParserError};
 use crate::tokenizer::Token;
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 /// A [`Dialect`] for [Microsoft SQL Server](https://www.microsoft.com/en-us/sql-server/)
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -278,13 +278,12 @@ impl MsSqlDialect {
             }
         } else {
             let stmt = parser.parse_statement()?;
+            let statements = parser.vec_of([stmt])?;
             ConditionalStatementBlock {
                 start_token: AttachedToken(if_token),
                 condition: Some(condition),
                 then_token: None,
-                conditional_statements: ConditionalStatements::Sequence {
-                    statements: vec![stmt],
-                },
+                conditional_statements: ConditionalStatements::Sequence { statements },
             }
         };
 
@@ -313,13 +312,12 @@ impl MsSqlDialect {
                 });
             } else {
                 let stmt = parser.parse_statement()?;
+                let statements = parser.vec_of([stmt])?;
                 else_block = Some(ConditionalStatementBlock {
                     start_token: AttachedToken(else_token),
                     condition: None,
                     then_token: None,
-                    conditional_statements: ConditionalStatements::Sequence {
-                        statements: vec![stmt],
-                    },
+                    conditional_statements: ConditionalStatements::Sequence { statements },
                 });
             }
         } else if prior_statement_ended_with_semi_colon {
@@ -392,7 +390,8 @@ impl MsSqlDialect {
                     break;
                 }
             }
-            stmts.push(parser.parse_statement()?);
+            let stmt = parser.parse_statement()?;
+            parser.push(&mut stmts, stmt)?;
             while let Token::SemiColon = parser.peek_token_ref().token {
                 parser.advance_token();
             }

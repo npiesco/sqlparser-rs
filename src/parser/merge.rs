@@ -36,9 +36,8 @@ impl Parser<'_> {
         &mut self,
         merge_token: TokenWithSpan,
     ) -> Result<Box<SetExpr>, ParserError> {
-        Ok(Box::new(SetExpr::Merge(
-            self.parse_merge(merge_token)?.into(),
-        )))
+        let merge = self.parse_merge(merge_token)?;
+        self.boxed(SetExpr::Merge(merge.into()))
     }
 
     /// Parse a `MERGE` statement
@@ -54,7 +53,10 @@ impl Parser<'_> {
         let on = self.parse_expr()?;
         let clauses = self.parse_merge_clauses()?;
         let output = match self.parse_one_of_keywords(&[Keyword::OUTPUT, Keyword::RETURNING]) {
-            Some(keyword) => Some(self.parse_output(keyword, self.get_current_token().clone())?),
+            Some(keyword) => {
+                let start_token = self.copied(self.get_current_token())?;
+                Some(self.parse_output(keyword, start_token)?)
+            }
             None => None,
         };
 
@@ -64,7 +66,7 @@ impl Parser<'_> {
             into,
             table,
             source,
-            on: Box::new(on),
+            on: self.boxed(on)?,
             clauses,
             output,
         })
@@ -76,7 +78,7 @@ impl Parser<'_> {
             if !(self.parse_keyword(Keyword::WHEN)) {
                 break;
             }
-            let when_token = self.get_current_token().clone();
+            let when_token = self.copied(self.get_current_token())?;
 
             let mut clause_kind = MergeClauseKind::Matched;
             if self.parse_keyword(Keyword::NOT) {
@@ -119,7 +121,7 @@ impl Parser<'_> {
                         );
                     }
 
-                    let update_token = self.get_current_token().clone();
+                    let update_token = self.copied(self.get_current_token())?;
                     self.expect_keyword_is(Keyword::SET)?;
                     let assignments = self.parse_comma_separated(Parser::parse_assignment)?;
                     let update_predicate = if self.parse_keyword(Keyword::WHERE) {
@@ -152,7 +154,7 @@ impl Parser<'_> {
                         );
                     };
 
-                    let delete_token = self.get_current_token().clone();
+                    let delete_token = self.copied(self.get_current_token())?;
                     MergeAction::Delete {
                         delete_token: delete_token.into(),
                     }
@@ -169,17 +171,17 @@ impl Parser<'_> {
                         );
                     };
 
-                    let insert_token = self.get_current_token().clone();
+                    let insert_token = self.copied(self.get_current_token())?;
                     let is_mysql = dialect_of!(self is MySqlDialect);
 
                     let columns = self.parse_merge_clause_insert_columns(is_mysql)?;
                     let (kind, kind_token) = if dialect_of!(self is BigQueryDialect | GenericDialect)
                         && self.parse_keyword(Keyword::ROW)
                     {
-                        (MergeInsertKind::Row, self.get_current_token().clone())
+                        (MergeInsertKind::Row, self.copied(self.get_current_token())?)
                     } else {
                         self.expect_keyword_is(Keyword::VALUES)?;
-                        let values_token = self.get_current_token().clone();
+                        let values_token = self.copied(self.get_current_token())?;
                         let values = self.parse_values(is_mysql, false)?;
                         (MergeInsertKind::Values(values), values_token)
                     };
@@ -205,12 +207,15 @@ impl Parser<'_> {
                     );
                 }
             };
-            clauses.push(MergeClause {
-                when_token: when_token.into(),
-                clause_kind,
-                predicate,
-                action: merge_clause,
-            });
+            self.push(
+                &mut clauses,
+                MergeClause {
+                    when_token: when_token.into(),
+                    clause_kind,
+                    predicate,
+                    action: merge_clause,
+                },
+            )?;
         }
         Ok(clauses)
     }
@@ -227,10 +232,8 @@ impl Parser<'_> {
         &mut self,
     ) -> Result<Option<OutputClause>, ParserError> {
         if self.parse_keyword(Keyword::OUTPUT) {
-            Ok(Some(self.parse_output(
-                Keyword::OUTPUT,
-                self.get_current_token().clone(),
-            )?))
+            let start_token = self.copied(self.get_current_token())?;
+            Ok(Some(self.parse_output(Keyword::OUTPUT, start_token)?))
         } else {
             Ok(None)
         }

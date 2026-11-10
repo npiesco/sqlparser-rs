@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(not(feature = "std"))]
-use crate::alloc::string::ToString;
 use crate::ast::helpers::attached_token::AttachedToken;
 use crate::ast::helpers::key_value_options::{
     KeyValueOption, KeyValueOptionKind, KeyValueOptions, KeyValueOptionsDelimiter,
@@ -34,7 +32,8 @@ use crate::ast::{
     Insert, MultiTableInsertIntoClause, MultiTableInsertType, MultiTableInsertValue,
     MultiTableInsertValues, MultiTableInsertWhenClause, ObjectName, ObjectNamePart,
     RefreshModeKind, RowAccessPolicy, ShowObjects, SqlOption, Statement, StorageLifecyclePolicy,
-    StorageSerializationPolicy, TableObject, TagsColumnOption, Value, WrappedCollection,
+    StorageSerializationPolicy, TableAlias, TableObject, TagsColumnOption, Value,
+    WrappedCollection,
 };
 use crate::dialect::{Dialect, Precedence};
 use crate::keywords::Keyword;
@@ -42,13 +41,11 @@ use crate::parser::{IsOptional, Parser, ParserError};
 use crate::tokenizer::TokenWithSpan;
 use crate::tokenizer::{Span, Token};
 #[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
-#[cfg(not(feature = "std"))]
 use alloc::string::String;
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::vec;
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec};
+use alloc::vec::Vec;
 
 use super::keywords::RESERVED_FOR_IDENTIFIER;
 
@@ -370,7 +367,7 @@ impl Dialect for SnowflakeDialect {
         // Check for multi-table INSERT
         // `INSERT [OVERWRITE] ALL ... or INSERT [OVERWRITE] FIRST ...`
         if parser.parse_keyword(Keyword::INSERT) {
-            let insert_token = parser.get_current_token().clone();
+            let insert_at = parser.get_current_index();
             let overwrite = parser.parse_keyword(Keyword::OVERWRITE);
 
             // Check for ALL or FIRST keyword
@@ -378,6 +375,10 @@ impl Dialect for SnowflakeDialect {
                 let multi_table_insert_type = match kw {
                     Keyword::FIRST => MultiTableInsertType::First,
                     _ => MultiTableInsertType::All,
+                };
+                let insert_token = match parser.copied(parser.token_at(insert_at)) {
+                    Ok(insert_token) => insert_token,
+                    Err(refused) => return Some(Err(refused)),
                 };
                 return Some(parse_multi_table_insert(
                     parser,
@@ -422,7 +423,7 @@ impl Dialect for SnowflakeDialect {
             } else if parser.parse_keywords(&[Keyword::TAG]) {
                 Ok(parse_column_tags(parser, with).map(|p| Some(ColumnOption::Tags(p))))
             } else {
-                Err(ParserError::ParserError("not found match".to_string()))
+                Err(parser.error(format_args!("not found match")))
             }
         })
     }
@@ -640,7 +641,7 @@ impl Dialect for SnowflakeDialect {
         name_parts: &[ObjectNamePart],
     ) -> bool {
         ident.quote_style.is_none()
-            && ident.value.to_lowercase() == "identifier"
+            && ident.value.eq_ignore_ascii_case("identifier")
             && !name_parts
                 .iter()
                 .any(|p| matches!(p, ObjectNamePart::Function(_)))
@@ -710,9 +711,9 @@ fn parse_file_staging_command(kw: Keyword, parser: &mut Parser) -> Result<Statem
         Keyword::REMOVE | Keyword::RM => {
             Ok(Statement::Remove(FileStagingCommand { stage, pattern }))
         }
-        _ => Err(ParserError::ParserError(
-            "unexpected stage command, expecting LIST, LS, REMOVE or RM".to_string(),
-        )),
+        _ => Err(parser.error(format_args!(
+            "unexpected stage command, expecting LIST, LS, REMOVE or RM"
+        ))),
     }
 }
 
@@ -736,17 +737,18 @@ fn parse_alter_dynamic_table(parser: &mut Parser) -> Result<Statement, ParserErr
         );
     };
 
-    let end_token = if parser.peek_token_ref().token == Token::SemiColon {
-        parser.peek_token_ref().clone()
+    let end_token = parser.copied(if parser.peek_token_ref().token == Token::SemiColon {
+        parser.peek_token_ref()
     } else {
-        parser.get_current_token().clone()
-    };
+        parser.get_current_token()
+    })?;
+    let operations = parser.vec_of([operation])?;
 
     Ok(Statement::AlterTable(AlterTable {
         name: table_name,
         if_exists: false,
         only: false,
-        operations: vec![operation],
+        operations,
         location: None,
         on_cluster: None,
         table_type: Some(AlterTableType::Dynamic),
@@ -763,9 +765,10 @@ fn parse_alter_external_table(parser: &mut Parser) -> Result<Statement, ParserEr
     // Parse the operation (REFRESH for now)
     let operation = if parser.parse_keyword(Keyword::REFRESH) {
         // Optional subpath for refreshing specific partitions
-        let subpath = match parser.peek_token().token {
+        let subpath = match &parser.peek_token_ref().token {
             Token::SingleQuotedString(s) => {
-                parser.next_token();
+                let s = parser.string(s)?;
+                parser.advance_token();
                 Some(s)
             }
             _ => None,
@@ -778,17 +781,18 @@ fn parse_alter_external_table(parser: &mut Parser) -> Result<Statement, ParserEr
         );
     };
 
-    let end_token = if parser.peek_token_ref().token == Token::SemiColon {
-        parser.peek_token_ref().clone()
+    let end_token = parser.copied(if parser.peek_token_ref().token == Token::SemiColon {
+        parser.peek_token_ref()
     } else {
-        parser.get_current_token().clone()
-    };
+        parser.get_current_token()
+    })?;
+    let operations = parser.vec_of([operation])?;
 
     Ok(Statement::AlterTable(AlterTable {
         name: table_name,
         if_exists,
         only: false,
-        operations: vec![operation],
+        operations,
         location: None,
         on_cluster: None,
         table_type: Some(AlterTableType::External),
@@ -843,201 +847,43 @@ pub fn parse_create_table(
     // "CREATE TABLE x COPY GRANTS (c INT)" and "CREATE TABLE x (c INT) COPY GRANTS" are both
     // accepted by Snowflake
 
-    let mut plain_options = vec![];
+    let mut plain_options = Vec::new();
+    // What each clause set holds: a clause given again replaces it, and it is given back.
+    let mut query_held = 0;
+    let mut clone_held = 0;
+    let mut like_held = 0;
+    let mut cluster_by_held = 0;
+    let mut collation_held = 0;
+    let mut aggregation_held = 0;
+    let mut row_access_held = 0;
+    let mut lifecycle_held = 0;
+    let mut tags_held = 0;
+    let mut external_volume_held = 0;
+    let mut catalog_held = 0;
+    let mut base_location_held = 0;
+    let mut catalog_sync_held = 0;
+    let mut target_lag_held = 0;
+    let mut warehouse_held = 0;
+    let mut version_held = 0;
+    let mut columns_held = 0;
 
     loop {
-        let next_token = parser.next_token();
-        match &next_token.token {
-            Token::Word(word) => match word.keyword {
-                Keyword::COPY => {
-                    parser.expect_keyword_is(Keyword::GRANTS)?;
-                    builder = builder.copy_grants(true);
-                }
-                Keyword::COMMENT => {
-                    // Rewind the COMMENT keyword
-                    parser.prev_token();
-                    if let Some(comment_def) = parser.parse_optional_inline_comment()? {
-                        plain_options.push(SqlOption::Comment(comment_def))
-                    }
-                }
-                Keyword::AS => {
-                    let query = parser.parse_query()?;
-                    builder = builder.query(Some(query));
-                }
-                Keyword::CLONE => {
-                    let clone = parser.parse_object_name(false).ok();
-                    builder = builder.clone_clause(clone);
-                }
-                Keyword::LIKE => {
-                    let name = parser.parse_object_name(false)?;
-                    builder = builder.like(Some(CreateTableLikeKind::Plain(
-                        crate::ast::CreateTableLike {
-                            name,
-                            defaults: None,
-                        },
-                    )));
-                }
-                Keyword::CLUSTER => {
-                    parser.expect_keyword_is(Keyword::BY)?;
-                    parser.expect_token(&Token::LParen)?;
-                    let cluster_by = Some(WrappedCollection::Parentheses(
-                        parser.parse_comma_separated(|p| p.parse_expr())?,
-                    ));
-                    parser.expect_token(&Token::RParen)?;
-
-                    builder = builder.cluster_by(cluster_by)
-                }
-                Keyword::ENABLE_SCHEMA_EVOLUTION => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.enable_schema_evolution(Some(parser.parse_boolean_string()?));
-                }
-                Keyword::CHANGE_TRACKING => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.change_tracking(Some(parser.parse_boolean_string()?));
-                }
-                Keyword::DATA_RETENTION_TIME_IN_DAYS => {
-                    parser.expect_token(&Token::Eq)?;
-                    let data_retention_time_in_days = parser.parse_literal_uint()?;
-                    builder =
-                        builder.data_retention_time_in_days(Some(data_retention_time_in_days));
-                }
-                Keyword::MAX_DATA_EXTENSION_TIME_IN_DAYS => {
-                    parser.expect_token(&Token::Eq)?;
-                    let max_data_extension_time_in_days = parser.parse_literal_uint()?;
-                    builder = builder
-                        .max_data_extension_time_in_days(Some(max_data_extension_time_in_days));
-                }
-                Keyword::DEFAULT_DDL_COLLATION => {
-                    parser.expect_token(&Token::Eq)?;
-                    let default_ddl_collation = parser.parse_literal_string()?;
-                    builder = builder.default_ddl_collation(Some(default_ddl_collation));
-                }
-                // WITH is optional, we just verify that next token is one of the expected ones and
-                // fallback to the default match statement
-                Keyword::WITH => {
-                    parser.expect_one_of_keywords(&[
-                        Keyword::AGGREGATION,
-                        Keyword::STORAGE,
-                        Keyword::TAG,
-                        Keyword::ROW,
-                    ])?;
-                    parser.prev_token();
-                }
-                Keyword::AGGREGATION => {
-                    parser.expect_keyword_is(Keyword::POLICY)?;
-                    let aggregation_policy = parser.parse_object_name(false)?;
-                    builder = builder.with_aggregation_policy(Some(aggregation_policy));
-                }
-                Keyword::ROW => {
-                    parser.expect_keywords(&[Keyword::ACCESS, Keyword::POLICY])?;
-                    let policy = parser.parse_object_name(false)?;
-                    parser.expect_keyword_is(Keyword::ON)?;
-                    parser.expect_token(&Token::LParen)?;
-                    let columns = parser.parse_comma_separated(|p| p.parse_identifier())?;
-                    parser.expect_token(&Token::RParen)?;
-
-                    builder =
-                        builder.with_row_access_policy(Some(RowAccessPolicy::new(policy, columns)))
-                }
-                Keyword::STORAGE => {
-                    parser.expect_keywords(&[Keyword::LIFECYCLE, Keyword::POLICY])?;
-                    let policy = parser.parse_object_name(false)?;
-                    parser.expect_keyword_is(Keyword::ON)?;
-                    parser.expect_token(&Token::LParen)?;
-                    let columns = parser.parse_comma_separated(|p| p.parse_identifier())?;
-                    parser.expect_token(&Token::RParen)?;
-
-                    builder = builder.with_storage_lifecycle_policy(Some(StorageLifecyclePolicy {
-                        policy,
-                        on: columns,
-                    }))
-                }
-                Keyword::TAG => {
-                    parser.expect_token(&Token::LParen)?;
-                    let tags = parser.parse_comma_separated(Parser::parse_tag)?;
-                    parser.expect_token(&Token::RParen)?;
-                    builder = builder.with_tags(Some(tags));
-                }
-                Keyword::ON if parser.parse_keyword(Keyword::COMMIT) => {
-                    let on_commit = Some(parser.parse_create_table_on_commit()?);
-                    builder = builder.on_commit(on_commit);
-                }
-                Keyword::EXTERNAL_VOLUME => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder.external_volume = Some(parser.parse_literal_string()?);
-                }
-                Keyword::CATALOG => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder.catalog = Some(parser.parse_literal_string()?);
-                }
-                Keyword::BASE_LOCATION => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder.base_location = Some(parser.parse_literal_string()?);
-                }
-                Keyword::CATALOG_SYNC => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder.catalog_sync = Some(parser.parse_literal_string()?);
-                }
-                Keyword::STORAGE_SERIALIZATION_POLICY => {
-                    parser.expect_token(&Token::Eq)?;
-
-                    builder.storage_serialization_policy =
-                        Some(parse_storage_serialization_policy(parser)?);
-                }
-                Keyword::IF if parser.parse_keywords(&[Keyword::NOT, Keyword::EXISTS]) => {
-                    builder = builder.if_not_exists(true);
-                }
-                Keyword::TARGET_LAG => {
-                    parser.expect_token(&Token::Eq)?;
-                    let target_lag = parser.parse_literal_string()?;
-                    builder = builder.target_lag(Some(target_lag));
-                }
-                Keyword::WAREHOUSE => {
-                    parser.expect_token(&Token::Eq)?;
-                    let warehouse = parser.parse_identifier()?;
-                    builder = builder.warehouse(Some(warehouse));
-                }
-                Keyword::AT | Keyword::BEFORE => {
-                    parser.prev_token();
-                    let version = parser.maybe_parse_table_version()?;
-                    builder = builder.version(version);
-                }
-                Keyword::REFRESH_MODE => {
-                    parser.expect_token(&Token::Eq)?;
-                    let refresh_mode = match parser.parse_one_of_keywords(&[
-                        Keyword::AUTO,
-                        Keyword::FULL,
-                        Keyword::INCREMENTAL,
-                    ]) {
-                        Some(Keyword::AUTO) => Some(RefreshModeKind::Auto),
-                        Some(Keyword::FULL) => Some(RefreshModeKind::Full),
-                        Some(Keyword::INCREMENTAL) => Some(RefreshModeKind::Incremental),
-                        _ => return parser.expected("AUTO, FULL or INCREMENTAL", next_token),
-                    };
-                    builder = builder.refresh_mode(refresh_mode);
-                }
-                Keyword::INITIALIZE => {
-                    parser.expect_token(&Token::Eq)?;
-                    let initialize = match parser
-                        .parse_one_of_keywords(&[Keyword::ON_CREATE, Keyword::ON_SCHEDULE])
-                    {
-                        Some(Keyword::ON_CREATE) => Some(InitializeKind::OnCreate),
-                        Some(Keyword::ON_SCHEDULE) => Some(InitializeKind::OnSchedule),
-                        _ => return parser.expected("ON_CREATE or ON_SCHEDULE", next_token),
-                    };
-                    builder = builder.initialize(initialize);
-                }
-                Keyword::REQUIRE if parser.parse_keyword(Keyword::USER) => {
-                    builder = builder.require_user(true);
-                }
-                _ => {
-                    return parser.expected("end of statement", next_token);
-                }
-            },
+        parser.advance_token();
+        let at = parser.get_current_index();
+        let keyword = match &parser.token_at(at).token {
+            Token::Word(word) => word.keyword,
             Token::LParen => {
                 parser.prev_token();
+                let before = parser.kept();
                 let (columns, constraints) = parser.parse_columns()?;
-                builder = builder.columns(columns).constraints(constraints);
+                let made = parser.kept() - before;
+                let was = (
+                    core::mem::replace(&mut builder.columns, columns),
+                    core::mem::replace(&mut builder.constraints, constraints),
+                );
+                parser.freed(was, columns_held);
+                columns_held = made;
+                continue;
             }
             Token::EOF => {
                 break;
@@ -1047,7 +893,266 @@ pub fn parse_create_table(
                 break;
             }
             _ => {
-                return parser.expected("end of statement", next_token);
+                return parser.expected_at("end of statement", at);
+            }
+        };
+        match keyword {
+            Keyword::COPY => {
+                parser.expect_keyword_is(Keyword::GRANTS)?;
+                builder = builder.copy_grants(true);
+            }
+            Keyword::COMMENT => {
+                // Rewind the COMMENT keyword
+                parser.prev_token();
+                if let Some(comment_def) = parser.parse_optional_inline_comment()? {
+                    parser.push(&mut plain_options, SqlOption::Comment(comment_def))?;
+                }
+            }
+            Keyword::AS => {
+                let before = parser.kept();
+                let query = parser.parse_query()?;
+                parser.set(&mut builder.query, &mut query_held, before, Some(query));
+            }
+            Keyword::CLONE => {
+                let before = parser.kept();
+                let made = parser.parse_object_name(false);
+                let clone = parser.optional(before, made)?;
+                parser.set(&mut builder.clone, &mut clone_held, before, clone);
+            }
+            Keyword::LIKE => {
+                let before = parser.kept();
+                let name = parser.parse_object_name(false)?;
+                let like = Some(CreateTableLikeKind::Plain(crate::ast::CreateTableLike {
+                    name,
+                    defaults: None,
+                }));
+                parser.set(&mut builder.like, &mut like_held, before, like);
+            }
+            Keyword::CLUSTER => {
+                parser.expect_keyword_is(Keyword::BY)?;
+                parser.expect_token(&Token::LParen)?;
+                let before = parser.kept();
+                let cluster_by = Some(WrappedCollection::Parentheses(
+                    parser.parse_comma_separated(|p| p.parse_expr())?,
+                ));
+                parser.expect_token(&Token::RParen)?;
+
+                parser.set(
+                    &mut builder.cluster_by,
+                    &mut cluster_by_held,
+                    before,
+                    cluster_by,
+                );
+            }
+            Keyword::ENABLE_SCHEMA_EVOLUTION => {
+                parser.expect_token(&Token::Eq)?;
+                builder = builder.enable_schema_evolution(Some(parser.parse_boolean_string()?));
+            }
+            Keyword::CHANGE_TRACKING => {
+                parser.expect_token(&Token::Eq)?;
+                builder = builder.change_tracking(Some(parser.parse_boolean_string()?));
+            }
+            Keyword::DATA_RETENTION_TIME_IN_DAYS => {
+                parser.expect_token(&Token::Eq)?;
+                let data_retention_time_in_days = parser.parse_literal_uint()?;
+                builder = builder.data_retention_time_in_days(Some(data_retention_time_in_days));
+            }
+            Keyword::MAX_DATA_EXTENSION_TIME_IN_DAYS => {
+                parser.expect_token(&Token::Eq)?;
+                let max_data_extension_time_in_days = parser.parse_literal_uint()?;
+                builder =
+                    builder.max_data_extension_time_in_days(Some(max_data_extension_time_in_days));
+            }
+            Keyword::DEFAULT_DDL_COLLATION => {
+                parser.expect_token(&Token::Eq)?;
+                let before = parser.kept();
+                let default_ddl_collation = parser.parse_literal_string()?;
+                parser.set(
+                    &mut builder.default_ddl_collation,
+                    &mut collation_held,
+                    before,
+                    Some(default_ddl_collation),
+                );
+            }
+            // WITH is optional, we just verify that next token is one of the expected ones and
+            // fallback to the default match statement
+            Keyword::WITH => {
+                parser.expect_one_of_keywords(&[
+                    Keyword::AGGREGATION,
+                    Keyword::STORAGE,
+                    Keyword::TAG,
+                    Keyword::ROW,
+                ])?;
+                parser.prev_token();
+            }
+            Keyword::AGGREGATION => {
+                parser.expect_keyword_is(Keyword::POLICY)?;
+                let before = parser.kept();
+                let aggregation_policy = parser.parse_object_name(false)?;
+                parser.set(
+                    &mut builder.with_aggregation_policy,
+                    &mut aggregation_held,
+                    before,
+                    Some(aggregation_policy),
+                );
+            }
+            Keyword::ROW => {
+                parser.expect_keywords(&[Keyword::ACCESS, Keyword::POLICY])?;
+                let before = parser.kept();
+                let policy = parser.parse_object_name(false)?;
+                parser.expect_keyword_is(Keyword::ON)?;
+                parser.expect_token(&Token::LParen)?;
+                let columns = parser.parse_comma_separated(|p| p.parse_identifier())?;
+                parser.expect_token(&Token::RParen)?;
+
+                parser.set(
+                    &mut builder.with_row_access_policy,
+                    &mut row_access_held,
+                    before,
+                    Some(RowAccessPolicy::new(policy, columns)),
+                );
+            }
+            Keyword::STORAGE => {
+                parser.expect_keywords(&[Keyword::LIFECYCLE, Keyword::POLICY])?;
+                let before = parser.kept();
+                let policy = parser.parse_object_name(false)?;
+                parser.expect_keyword_is(Keyword::ON)?;
+                parser.expect_token(&Token::LParen)?;
+                let columns = parser.parse_comma_separated(|p| p.parse_identifier())?;
+                parser.expect_token(&Token::RParen)?;
+
+                parser.set(
+                    &mut builder.with_storage_lifecycle_policy,
+                    &mut lifecycle_held,
+                    before,
+                    Some(StorageLifecyclePolicy {
+                        policy,
+                        on: columns,
+                    }),
+                );
+            }
+            Keyword::TAG => {
+                parser.expect_token(&Token::LParen)?;
+                let before = parser.kept();
+                let tags = parser.parse_comma_separated(Parser::parse_tag)?;
+                parser.expect_token(&Token::RParen)?;
+                parser.set(&mut builder.with_tags, &mut tags_held, before, Some(tags));
+            }
+            Keyword::ON if parser.parse_keyword(Keyword::COMMIT) => {
+                let on_commit = Some(parser.parse_create_table_on_commit()?);
+                builder = builder.on_commit(on_commit);
+            }
+            Keyword::EXTERNAL_VOLUME => {
+                parser.expect_token(&Token::Eq)?;
+                let before = parser.kept();
+                let external_volume = parser.parse_literal_string()?;
+                parser.set(
+                    &mut builder.external_volume,
+                    &mut external_volume_held,
+                    before,
+                    Some(external_volume),
+                );
+            }
+            Keyword::CATALOG => {
+                parser.expect_token(&Token::Eq)?;
+                let before = parser.kept();
+                let catalog = parser.parse_literal_string()?;
+                parser.set(
+                    &mut builder.catalog,
+                    &mut catalog_held,
+                    before,
+                    Some(catalog),
+                );
+            }
+            Keyword::BASE_LOCATION => {
+                parser.expect_token(&Token::Eq)?;
+                let before = parser.kept();
+                let base_location = parser.parse_literal_string()?;
+                parser.set(
+                    &mut builder.base_location,
+                    &mut base_location_held,
+                    before,
+                    Some(base_location),
+                );
+            }
+            Keyword::CATALOG_SYNC => {
+                parser.expect_token(&Token::Eq)?;
+                let before = parser.kept();
+                let catalog_sync = parser.parse_literal_string()?;
+                parser.set(
+                    &mut builder.catalog_sync,
+                    &mut catalog_sync_held,
+                    before,
+                    Some(catalog_sync),
+                );
+            }
+            Keyword::STORAGE_SERIALIZATION_POLICY => {
+                parser.expect_token(&Token::Eq)?;
+
+                builder.storage_serialization_policy =
+                    Some(parse_storage_serialization_policy(parser)?);
+            }
+            Keyword::IF if parser.parse_keywords(&[Keyword::NOT, Keyword::EXISTS]) => {
+                builder = builder.if_not_exists(true);
+            }
+            Keyword::TARGET_LAG => {
+                parser.expect_token(&Token::Eq)?;
+                let before = parser.kept();
+                let target_lag = parser.parse_literal_string()?;
+                parser.set(
+                    &mut builder.target_lag,
+                    &mut target_lag_held,
+                    before,
+                    Some(target_lag),
+                );
+            }
+            Keyword::WAREHOUSE => {
+                parser.expect_token(&Token::Eq)?;
+                let before = parser.kept();
+                let warehouse = parser.parse_identifier()?;
+                parser.set(
+                    &mut builder.warehouse,
+                    &mut warehouse_held,
+                    before,
+                    Some(warehouse),
+                );
+            }
+            Keyword::AT | Keyword::BEFORE => {
+                parser.prev_token();
+                let before = parser.kept();
+                let version = parser.maybe_parse_table_version()?;
+                parser.set(&mut builder.version, &mut version_held, before, version);
+            }
+            Keyword::REFRESH_MODE => {
+                parser.expect_token(&Token::Eq)?;
+                let refresh_mode = match parser.parse_one_of_keywords(&[
+                    Keyword::AUTO,
+                    Keyword::FULL,
+                    Keyword::INCREMENTAL,
+                ]) {
+                    Some(Keyword::AUTO) => Some(RefreshModeKind::Auto),
+                    Some(Keyword::FULL) => Some(RefreshModeKind::Full),
+                    Some(Keyword::INCREMENTAL) => Some(RefreshModeKind::Incremental),
+                    _ => return parser.expected_at("AUTO, FULL or INCREMENTAL", at),
+                };
+                builder = builder.refresh_mode(refresh_mode);
+            }
+            Keyword::INITIALIZE => {
+                parser.expect_token(&Token::Eq)?;
+                let initialize = match parser
+                    .parse_one_of_keywords(&[Keyword::ON_CREATE, Keyword::ON_SCHEDULE])
+                {
+                    Some(Keyword::ON_CREATE) => Some(InitializeKind::OnCreate),
+                    Some(Keyword::ON_SCHEDULE) => Some(InitializeKind::OnSchedule),
+                    _ => return parser.expected_at("ON_CREATE or ON_SCHEDULE", at),
+                };
+                builder = builder.initialize(initialize);
+            }
+            Keyword::REQUIRE if parser.parse_keyword(Keyword::USER) => {
+                builder = builder.require_user(true);
+            }
+            _ => {
+                return parser.expected_at("end of statement", at);
             }
         }
     }
@@ -1060,9 +1165,7 @@ pub fn parse_create_table(
     builder = builder.table_options(table_options);
 
     if iceberg && builder.base_location.is_none() {
-        return Err(ParserError::ParserError(
-            "BASE_LOCATION is required for ICEBERG tables".to_string(),
-        ));
+        return Err(parser.error(format_args!("BASE_LOCATION is required for ICEBERG tables")));
     }
 
     Ok(builder.build())
@@ -1083,95 +1186,133 @@ pub fn parse_create_database(
         .transient(transient)
         .if_not_exists(if_not_exists);
 
+    // What each clause set holds: a clause given again replaces it, and it is given back.
+    let mut clone_held = 0;
+    let mut external_volume_held = 0;
+    let mut catalog_held = 0;
+    let mut collation_held = 0;
+    let mut comment_held = 0;
+    let mut catalog_sync_held = 0;
+    let mut delimiter_held = 0;
+    let mut tags_held = 0;
+    let mut contacts_held = 0;
+
     loop {
-        let next_token = parser.next_token();
-        match &next_token.token {
-            Token::Word(word) => match word.keyword {
-                Keyword::CLONE => {
-                    builder = builder.clone_clause(Some(parser.parse_object_name(false)?));
-                }
-                Keyword::DATA_RETENTION_TIME_IN_DAYS => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder =
-                        builder.data_retention_time_in_days(Some(parser.parse_literal_uint()?));
-                }
-                Keyword::MAX_DATA_EXTENSION_TIME_IN_DAYS => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder =
-                        builder.max_data_extension_time_in_days(Some(parser.parse_literal_uint()?));
-                }
-                Keyword::EXTERNAL_VOLUME => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.external_volume(Some(parser.parse_literal_string()?));
-                }
-                Keyword::CATALOG => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.catalog(Some(parser.parse_literal_string()?));
-                }
-                Keyword::REPLACE_INVALID_CHARACTERS => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder =
-                        builder.replace_invalid_characters(Some(parser.parse_boolean_string()?));
-                }
-                Keyword::DEFAULT_DDL_COLLATION => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.default_ddl_collation(Some(parser.parse_literal_string()?));
-                }
-                Keyword::STORAGE_SERIALIZATION_POLICY => {
-                    parser.expect_token(&Token::Eq)?;
-                    let policy = parse_storage_serialization_policy(parser)?;
-                    builder = builder.storage_serialization_policy(Some(policy));
-                }
-                Keyword::COMMENT => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.comment(Some(parser.parse_literal_string()?));
-                }
-                Keyword::CATALOG_SYNC => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.catalog_sync(Some(parser.parse_literal_string()?));
-                }
-                Keyword::CATALOG_SYNC_NAMESPACE_FLATTEN_DELIMITER => {
-                    parser.expect_token(&Token::Eq)?;
-                    builder = builder.catalog_sync_namespace_flatten_delimiter(Some(
-                        parser.parse_literal_string()?,
-                    ));
-                }
-                Keyword::CATALOG_SYNC_NAMESPACE_MODE => {
-                    parser.expect_token(&Token::Eq)?;
-                    let mode =
-                        match parser.parse_one_of_keywords(&[Keyword::NEST, Keyword::FLATTEN]) {
-                            Some(Keyword::NEST) => CatalogSyncNamespaceMode::Nest,
-                            Some(Keyword::FLATTEN) => CatalogSyncNamespaceMode::Flatten,
-                            _ => {
-                                return parser.expected("NEST or FLATTEN", next_token);
-                            }
-                        };
-                    builder = builder.catalog_sync_namespace_mode(Some(mode));
-                }
-                Keyword::WITH => {
-                    if parser.parse_keyword(Keyword::TAG) {
-                        parser.expect_token(&Token::LParen)?;
-                        let tags = parser.parse_comma_separated(Parser::parse_tag)?;
-                        parser.expect_token(&Token::RParen)?;
-                        builder = builder.with_tags(Some(tags));
-                    } else if parser.parse_keyword(Keyword::CONTACT) {
-                        parser.expect_token(&Token::LParen)?;
-                        let contacts = parser.parse_comma_separated(|p| {
+        parser.advance_token();
+        let at = parser.get_current_index();
+        let keyword = match &parser.token_at(at).token {
+            Token::Word(word) => word.keyword,
+            Token::SemiColon | Token::EOF => break,
+            _ => return parser.expected_at("end of statement", at),
+        };
+        match keyword {
+            Keyword::CLONE => {
+                parser.replaced(&mut builder.clone, &mut clone_held, |p| {
+                    p.parse_object_name(false)
+                })?;
+            }
+            Keyword::DATA_RETENTION_TIME_IN_DAYS => {
+                parser.expect_token(&Token::Eq)?;
+                builder = builder.data_retention_time_in_days(Some(parser.parse_literal_uint()?));
+            }
+            Keyword::MAX_DATA_EXTENSION_TIME_IN_DAYS => {
+                parser.expect_token(&Token::Eq)?;
+                builder =
+                    builder.max_data_extension_time_in_days(Some(parser.parse_literal_uint()?));
+            }
+            Keyword::EXTERNAL_VOLUME => {
+                parser.expect_token(&Token::Eq)?;
+                parser.replaced(
+                    &mut builder.external_volume,
+                    &mut external_volume_held,
+                    Parser::parse_literal_string,
+                )?;
+            }
+            Keyword::CATALOG => {
+                parser.expect_token(&Token::Eq)?;
+                parser.replaced(
+                    &mut builder.catalog,
+                    &mut catalog_held,
+                    Parser::parse_literal_string,
+                )?;
+            }
+            Keyword::REPLACE_INVALID_CHARACTERS => {
+                parser.expect_token(&Token::Eq)?;
+                builder = builder.replace_invalid_characters(Some(parser.parse_boolean_string()?));
+            }
+            Keyword::DEFAULT_DDL_COLLATION => {
+                parser.expect_token(&Token::Eq)?;
+                parser.replaced(
+                    &mut builder.default_ddl_collation,
+                    &mut collation_held,
+                    Parser::parse_literal_string,
+                )?;
+            }
+            Keyword::STORAGE_SERIALIZATION_POLICY => {
+                parser.expect_token(&Token::Eq)?;
+                let policy = parse_storage_serialization_policy(parser)?;
+                builder = builder.storage_serialization_policy(Some(policy));
+            }
+            Keyword::COMMENT => {
+                parser.expect_token(&Token::Eq)?;
+                parser.replaced(
+                    &mut builder.comment,
+                    &mut comment_held,
+                    Parser::parse_literal_string,
+                )?;
+            }
+            Keyword::CATALOG_SYNC => {
+                parser.expect_token(&Token::Eq)?;
+                parser.replaced(
+                    &mut builder.catalog_sync,
+                    &mut catalog_sync_held,
+                    Parser::parse_literal_string,
+                )?;
+            }
+            Keyword::CATALOG_SYNC_NAMESPACE_FLATTEN_DELIMITER => {
+                parser.expect_token(&Token::Eq)?;
+                parser.replaced(
+                    &mut builder.catalog_sync_namespace_flatten_delimiter,
+                    &mut delimiter_held,
+                    Parser::parse_literal_string,
+                )?;
+            }
+            Keyword::CATALOG_SYNC_NAMESPACE_MODE => {
+                parser.expect_token(&Token::Eq)?;
+                let mode = match parser.parse_one_of_keywords(&[Keyword::NEST, Keyword::FLATTEN]) {
+                    Some(Keyword::NEST) => CatalogSyncNamespaceMode::Nest,
+                    Some(Keyword::FLATTEN) => CatalogSyncNamespaceMode::Flatten,
+                    _ => {
+                        return parser.expected_at("NEST or FLATTEN", at);
+                    }
+                };
+                builder = builder.catalog_sync_namespace_mode(Some(mode));
+            }
+            Keyword::WITH => {
+                if parser.parse_keyword(Keyword::TAG) {
+                    parser.replaced(&mut builder.with_tags, &mut tags_held, |p| {
+                        p.expect_token(&Token::LParen)?;
+                        let tags = p.parse_comma_separated(Parser::parse_tag)?;
+                        p.expect_token(&Token::RParen)?;
+                        Ok(tags)
+                    })?;
+                } else if parser.parse_keyword(Keyword::CONTACT) {
+                    parser.replaced(&mut builder.with_contacts, &mut contacts_held, |p| {
+                        p.expect_token(&Token::LParen)?;
+                        let contacts = p.parse_comma_separated(|p| {
                             let purpose = p.parse_identifier()?.value;
                             p.expect_token(&Token::Eq)?;
                             let contact = p.parse_identifier()?.value;
                             Ok(ContactEntry { purpose, contact })
                         })?;
-                        parser.expect_token(&Token::RParen)?;
-                        builder = builder.with_contacts(Some(contacts));
-                    } else {
-                        return parser.expected("TAG or CONTACT", next_token);
-                    }
+                        p.expect_token(&Token::RParen)?;
+                        Ok(contacts)
+                    })?;
+                } else {
+                    return parser.expected_at("TAG or CONTACT", at);
                 }
-                _ => return parser.expected("end of statement", next_token),
-            },
-            Token::SemiColon | Token::EOF => break,
-            _ => return parser.expected("end of statement", next_token),
+            }
+            _ => return parser.expected_at("end of statement", at),
         }
     }
     Ok(builder.build())
@@ -1180,14 +1321,15 @@ pub fn parse_create_database(
 pub fn parse_storage_serialization_policy(
     parser: &mut Parser,
 ) -> Result<StorageSerializationPolicy, ParserError> {
-    let next_token = parser.next_token();
-    match &next_token.token {
+    parser.advance_token();
+    let at = parser.get_current_index();
+    match &parser.token_at(at).token {
         Token::Word(w) => match w.keyword {
             Keyword::COMPATIBLE => Ok(StorageSerializationPolicy::Compatible),
             Keyword::OPTIMIZED => Ok(StorageSerializationPolicy::Optimized),
-            _ => parser.expected("storage_serialization_policy", next_token),
+            _ => parser.expected_at("storage_serialization_policy", at),
         },
-        _ => parser.expected("storage_serialization_policy", next_token),
+        _ => parser.expected_at("storage_serialization_policy", at),
     }
 }
 
@@ -1255,8 +1397,8 @@ pub fn parse_create_stage(
 
 pub fn parse_stage_name_identifier(parser: &mut Parser) -> Result<Ident, ParserError> {
     let mut ident = String::new();
-    while let Some(next_token) = parser.next_token_no_skip() {
-        match &next_token.token {
+    while parser.next_token_no_skip().is_some() {
+        let text = match &parser.get_current_token().token {
             Token::Whitespace(_) | Token::SemiColon => break,
             Token::Period => {
                 parser.prev_token();
@@ -1266,18 +1408,22 @@ pub fn parse_stage_name_identifier(parser: &mut Parser) -> Result<Ident, ParserE
                 parser.prev_token();
                 break;
             }
-            Token::AtSign => ident.push('@'),
-            Token::Tilde => ident.push('~'),
-            Token::Mod => ident.push('%'),
-            Token::Div => ident.push('/'),
-            Token::Plus => ident.push('+'),
-            Token::Minus => ident.push('-'),
-            Token::Eq => ident.push('='),
-            Token::Colon => ident.push(':'),
-            Token::Number(n, _) => ident.push_str(n),
-            Token::Word(w) => ident.push_str(&w.to_string()),
+            Token::AtSign => "@",
+            Token::Tilde => "~",
+            Token::Mod => "%",
+            Token::Div => "/",
+            Token::Plus => "+",
+            Token::Minus => "-",
+            Token::Eq => "=",
+            Token::Colon => ":",
+            Token::Number(n, _) => n.as_str(),
+            Token::Word(w) => {
+                parser.append(&mut ident, format_args!("{w}"))?;
+                continue;
+            }
             _ => return parser.expected_ref("stage name identifier", parser.peek_token_ref()),
-        }
+        };
+        parser.append(&mut ident, format_args!("{text}"))?;
     }
     Ok(Ident::new(ident))
 }
@@ -1285,22 +1431,22 @@ pub fn parse_stage_name_identifier(parser: &mut Parser) -> Result<Ident, ParserE
 /// Parses a Snowflake stage name, which may start with `@` for internal stages.
 /// Examples: `@mystage`, `@namespace.stage`, `schema.table`
 pub fn parse_snowflake_stage_name(parser: &mut Parser) -> Result<ObjectName, ParserError> {
-    match parser.next_token().token {
+    match &parser.peek_token_ref().token {
         Token::AtSign => {
+            // Past what precedes the `@`, to read the name from it on.
+            parser.advance_token();
             parser.prev_token();
-            let mut idents = vec![];
+            let mut idents = Vec::new();
             loop {
-                idents.push(parse_stage_name_identifier(parser)?);
+                let ident = parse_stage_name_identifier(parser)?;
+                parser.push(&mut idents, ident)?;
                 if !parser.consume_token(&Token::Period) {
                     break;
                 }
             }
-            Ok(ObjectName::from(idents))
+            parser.object_name(idents)
         }
-        _ => {
-            parser.prev_token();
-            Ok(parser.parse_object_name(false)?)
-        }
+        _ => parser.parse_object_name(false),
     }
 }
 
@@ -1315,7 +1461,7 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
         _ => CopyIntoSnowflakeKind::Table,
     };
 
-    let mut files: Vec<String> = vec![];
+    let mut files: Vec<String> = Vec::new();
     let mut from_transformations: Option<Vec<StageLoadSelectItemKind>> = None;
     let mut from_stage_alias = None;
     let mut from_stage = None;
@@ -1338,19 +1484,29 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
     let mut pattern = None;
     let mut validation_mode = None;
     let mut copy_options = Vec::new();
+    // What each clause set holds: a clause given again replaces it, and it is given back.
+    let mut stage_params_held = 0;
+    let mut partition_held = 0;
+    let mut pattern_held = 0;
+    let mut validation_mode_held = 0;
+    let mut file_format_held = 0;
+    let mut copy_options_held = 0;
 
     let into: ObjectName = parse_snowflake_stage_name(parser)?;
     if kind == CopyIntoSnowflakeKind::Location {
-        stage_params = parse_stage_params(parser)?;
+        let before = parser.kept();
+        let params = parse_stage_params(parser)?;
+        parser.set(&mut stage_params, &mut stage_params_held, before, params);
     }
 
-    let into_columns = match &parser.peek_token().token {
+    let into_columns = match &parser.peek_token_ref().token {
         Token::LParen => Some(parser.parse_parenthesized_column_list(IsOptional::Optional, true)?),
         _ => None,
     };
 
     parser.expect_keyword_is(Keyword::FROM)?;
-    match parser.next_token().token {
+    parser.advance_token();
+    match &parser.get_current_token().token {
         Token::LParen if kind == CopyIntoSnowflakeKind::Table => {
             // Data load with transformations
             parser.expect_keyword_is(Keyword::SELECT)?;
@@ -1358,12 +1514,23 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
 
             parser.expect_keyword_is(Keyword::FROM)?;
             from_stage = Some(parse_snowflake_stage_name(parser)?);
-            stage_params = parse_stage_params(parser)?;
+            let before = parser.kept();
+            let params = parse_stage_params(parser)?;
+            parser.set(&mut stage_params, &mut stage_params_held, before, params);
 
             // Parse an optional alias
-            from_stage_alias = parser
-                .maybe_parse_table_alias()?
-                .map(|table_alias| table_alias.name);
+            let before = parser.kept();
+            from_stage_alias = match parser.maybe_parse_table_alias()? {
+                Some(TableAlias {
+                    name, columns, at, ..
+                }) => {
+                    // All the alias made but its name is freed: given back.
+                    let rest = parser.kept() - before - name.value.capacity();
+                    parser.freed((columns, at), rest);
+                    Some(name)
+                }
+                None => None,
+            };
             parser.expect_token(&Token::RParen)?;
         }
         Token::LParen if kind == CopyIntoSnowflakeKind::Location => {
@@ -1374,12 +1541,15 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
         _ => {
             parser.prev_token();
             from_stage = Some(parse_snowflake_stage_name(parser)?);
-            stage_params = parse_stage_params(parser)?;
+            let before = parser.kept();
+            let params = parse_stage_params(parser)?;
+            parser.set(&mut stage_params, &mut stage_params_held, before, params);
 
             // as
             from_stage_alias = if parser.parse_keyword(Keyword::AS) {
-                Some(match parser.next_token().token {
-                    Token::Word(w) => Ok(Ident::new(w.value)),
+                parser.advance_token();
+                Some(match &parser.get_current_token().token {
+                    Token::Word(w) => Ok(Ident::new(parser.string(&w.value)?)),
                     _ => parser.expected_ref("stage alias", parser.peek_token_ref()),
                 }?)
             } else {
@@ -1392,55 +1562,74 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
         // FILE_FORMAT
         if parser.parse_keyword(Keyword::FILE_FORMAT) {
             parser.expect_token(&Token::Eq)?;
-            file_format = parser.parse_key_value_options(true, &[])?.options;
+            let before = parser.kept();
+            let options = parser.parse_key_value_options(true, &[])?.options;
+            parser.set(&mut file_format, &mut file_format_held, before, options);
         // PARTITION BY
         } else if parser.parse_keywords(&[Keyword::PARTITION, Keyword::BY]) {
-            partition = Some(Box::new(parser.parse_expr()?))
+            parser.replaced(&mut partition, &mut partition_held, |p| {
+                let expr = p.parse_expr()?;
+                p.boxed(expr)
+            })?;
         // FILES
         } else if parser.parse_keyword(Keyword::FILES) {
             parser.expect_token(&Token::Eq)?;
             parser.expect_token(&Token::LParen)?;
-            let mut continue_loop = true;
-            while continue_loop {
-                continue_loop = false;
-                let next_token = parser.next_token();
-                match next_token.token {
-                    Token::SingleQuotedString(s) => files.push(s),
-                    _ => parser.expected("file token", next_token)?,
+            loop {
+                parser.advance_token();
+                let at = parser.get_current_index();
+                let file = match &parser.token_at(at).token {
+                    Token::SingleQuotedString(s) => parser.string(s)?,
+                    _ => return parser.expected_at("file token", at),
                 };
-                if parser.next_token().token.eq(&Token::Comma) {
-                    continue_loop = true;
-                } else {
-                    parser.prev_token(); // not a comma, need to go back
+                parser.push(&mut files, file)?;
+                if !parser.consume_token(&Token::Comma) {
+                    break;
                 }
             }
             parser.expect_token(&Token::RParen)?;
         // PATTERN
         } else if parser.parse_keyword(Keyword::PATTERN) {
             parser.expect_token(&Token::Eq)?;
-            let next_token = parser.next_token();
-            pattern = Some(match next_token.token {
-                Token::SingleQuotedString(s) => s,
-                _ => parser.expected("pattern", next_token)?,
-            });
+            parser.replaced(&mut pattern, &mut pattern_held, |p| {
+                p.advance_token();
+                let at = p.get_current_index();
+                match &p.token_at(at).token {
+                    Token::SingleQuotedString(s) => p.string(s),
+                    _ => p.expected_at("pattern", at),
+                }
+            })?;
         // VALIDATION MODE
         } else if parser.parse_keyword(Keyword::VALIDATION_MODE) {
             parser.expect_token(&Token::Eq)?;
-            validation_mode = Some(parser.next_token().token.to_string());
+            parser.replaced(&mut validation_mode, &mut validation_mode_held, |p| {
+                p.advance_token();
+                p.format(format_args!("{}", p.get_current_token().token))
+            })?;
         // COPY OPTIONS
         } else if parser.parse_keyword(Keyword::COPY_OPTIONS) {
             parser.expect_token(&Token::Eq)?;
-            copy_options = parser.parse_key_value_options(true, &[])?.options;
+            let before = parser.kept();
+            let options = parser.parse_key_value_options(true, &[])?.options;
+            parser.set(&mut copy_options, &mut copy_options_held, before, options);
         } else {
-            match parser.next_token().token {
+            parser.advance_token();
+            let at = parser.get_current_index();
+            match &parser.token_at(at).token {
                 Token::SemiColon | Token::EOF => break,
                 Token::Comma => continue,
                 // In `COPY INTO <location>` the copy options do not have a shared key
                 // like in `COPY INTO <table>`
-                Token::Word(key) => copy_options.push(parser.parse_key_value_option(&key)?),
+                Token::Word(key) => {
+                    let before = parser.kept();
+                    let option_name = parser.string(&key.value)?;
+                    let option = parser.parse_key_value_option(option_name)?;
+                    parser.push(&mut copy_options, option)?;
+                    copy_options_held += parser.kept() - before;
+                }
                 _ => {
                     return parser
-                        .expected_ref("another copy option, ; or EOF'", parser.peek_token_ref())
+                        .expected_ref("another copy option, ; or EOF'", parser.peek_token_ref());
                 }
             }
         }
@@ -1473,16 +1662,15 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
 fn parse_select_items_for_data_load(
     parser: &mut Parser,
 ) -> Result<Option<Vec<StageLoadSelectItemKind>>, ParserError> {
-    let mut select_items: Vec<StageLoadSelectItemKind> = vec![];
+    let mut select_items: Vec<StageLoadSelectItemKind> = Vec::new();
     loop {
-        match parser.maybe_parse(parse_select_item_for_data_load)? {
+        let item = match parser.maybe_parse(parse_select_item_for_data_load)? {
             // [<alias>.]$<file_col_num>[.<element>] [ , [<alias>.]$<file_col_num>[.<element>] ... ]
-            Some(item) => select_items.push(StageLoadSelectItemKind::StageLoadSelectItem(item)),
+            Some(item) => StageLoadSelectItemKind::StageLoadSelectItem(item),
             // Fallback, try to parse a standard SQL select item
-            None => select_items.push(StageLoadSelectItemKind::SelectItem(
-                parser.parse_select_item()?,
-            )),
-        }
+            None => StageLoadSelectItemKind::SelectItem(parser.parse_select_item()?),
+        };
+        parser.push(&mut select_items, item)?;
         if matches!(parser.peek_token_ref().token, Token::Comma) {
             parser.advance_token();
         } else {
@@ -1500,55 +1688,46 @@ fn parse_select_item_for_data_load(
     let mut element: Option<Ident> = None;
     let mut item_as: Option<Ident> = None;
 
-    let next_token = parser.next_token();
-    match next_token.token {
+    parser.advance_token();
+    let at = parser.get_current_index();
+    match &parser.token_at(at).token {
         Token::Placeholder(w) => {
-            file_col_num = w.to_string().split_off(1).parse::<i32>().map_err(|e| {
-                ParserError::ParserError(format!("Could not parse '{w}' as i32: {e}"))
-            })?;
-            Ok(())
+            file_col_num = parse_file_col_num(parser, w)?;
         }
         Token::Word(w) => {
-            alias = Some(Ident::new(w.value));
-            Ok(())
+            alias = Some(Ident::new(parser.string(&w.value)?));
         }
-        _ => parser.expected("alias or file_col_num", next_token),
-    }?;
+        _ => return parser.expected_at("alias or file_col_num", at),
+    }
 
     if alias.is_some() {
         parser.expect_token(&Token::Period)?;
         // now we get col_num token
-        let col_num_token = parser.next_token();
-        match col_num_token.token {
+        parser.advance_token();
+        let at = parser.get_current_index();
+        match &parser.token_at(at).token {
             Token::Placeholder(w) => {
-                file_col_num = w.to_string().split_off(1).parse::<i32>().map_err(|e| {
-                    ParserError::ParserError(format!("Could not parse '{w}' as i32: {e}"))
-                })?;
-                Ok(())
+                file_col_num = parse_file_col_num(parser, w)?;
             }
-            _ => parser.expected("file_col_num", col_num_token),
-        }?;
+            _ => return parser.expected_at("file_col_num", at),
+        }
     }
 
     // try extracting optional element
-    match parser.next_token().token {
-        Token::Colon => {
-            // parse element
-            element = Some(Ident::new(match parser.next_token().token {
-                Token::Word(w) => Ok(w.value),
-                _ => parser.expected_ref("file_col_num", parser.peek_token_ref()),
-            }?));
-        }
-        _ => {
-            // element not present move back
-            parser.prev_token();
-        }
+    if parser.consume_token(&Token::Colon) {
+        // parse element
+        parser.advance_token();
+        element = Some(Ident::new(match &parser.get_current_token().token {
+            Token::Word(w) => parser.string(&w.value),
+            _ => parser.expected_ref("file_col_num", parser.peek_token_ref()),
+        }?));
     }
 
     // as
     if parser.parse_keyword(Keyword::AS) {
-        item_as = Some(match parser.next_token().token {
-            Token::Word(w) => Ok(Ident::new(w.value)),
+        parser.advance_token();
+        item_as = Some(match &parser.get_current_token().token {
+            Token::Word(w) => Ok(Ident::new(parser.string(&w.value)?)),
             _ => parser.expected_ref("column item alias", parser.peek_token_ref()),
         }?);
     }
@@ -1559,6 +1738,13 @@ fn parse_select_item_for_data_load(
         element,
         item_as,
     })
+}
+
+/// The file column number the placeholder `placeholder` (`$<number>`) names.
+fn parse_file_col_num(parser: &Parser, placeholder: &str) -> Result<i32, ParserError> {
+    placeholder[1..]
+        .parse::<i32>()
+        .map_err(|e| parser.error(format_args!("Could not parse '{placeholder}' as i32: {e}")))
 }
 
 fn parse_stage_params(parser: &mut Parser) -> Result<StageParamsObject, ParserError> {
@@ -1575,8 +1761,9 @@ fn parse_stage_params(parser: &mut Parser) -> Result<StageParamsObject, ParserEr
     // URL
     if parser.parse_keyword(Keyword::URL) {
         parser.expect_token(&Token::Eq)?;
-        url = Some(match parser.next_token().token {
-            Token::SingleQuotedString(word) => Ok(word),
+        parser.advance_token();
+        url = Some(match &parser.get_current_token().token {
+            Token::SingleQuotedString(word) => parser.string(word),
             _ => parser.expected_ref("a URL statement", parser.peek_token_ref()),
         }?)
     }
@@ -1584,14 +1771,17 @@ fn parse_stage_params(parser: &mut Parser) -> Result<StageParamsObject, ParserEr
     // STORAGE INTEGRATION
     if parser.parse_keyword(Keyword::STORAGE_INTEGRATION) {
         parser.expect_token(&Token::Eq)?;
-        storage_integration = Some(parser.next_token().token.to_string());
+        parser.advance_token();
+        storage_integration =
+            Some(parser.format(format_args!("{}", parser.get_current_token().token))?);
     }
 
     // ENDPOINT
     if parser.parse_keyword(Keyword::ENDPOINT) {
         parser.expect_token(&Token::Eq)?;
-        endpoint = Some(match parser.next_token().token {
-            Token::SingleQuotedString(word) => Ok(word),
+        parser.advance_token();
+        endpoint = Some(match &parser.get_current_token().token {
+            Token::SingleQuotedString(word) => parser.string(word),
             _ => parser.expected_ref("an endpoint statement", parser.peek_token_ref()),
         }?)
     }
@@ -1632,41 +1822,37 @@ fn parse_session_options(
     set: bool,
 ) -> Result<Vec<KeyValueOption>, ParserError> {
     let mut options: Vec<KeyValueOption> = Vec::new();
-    let empty = String::new;
     loop {
-        let peeked_token = parser.peek_token();
-        match peeked_token.token {
+        let peeked_token = parser.peek_token_ref();
+        match &peeked_token.token {
             Token::SemiColon | Token::EOF => break,
             Token::Comma => {
                 parser.advance_token();
                 continue;
             }
             Token::Word(key) => {
+                let end = peeked_token.span.end;
+                let option_name = parser.string(&key.value)?;
                 parser.advance_token();
-                if set {
-                    let option = parser.parse_key_value_option(&key)?;
-                    options.push(option);
+                let option = if set {
+                    parser.parse_key_value_option(option_name)?
                 } else {
-                    options.push(KeyValueOption {
-                        option_name: key.value,
+                    KeyValueOption {
+                        option_name,
                         option_value: KeyValueOptionKind::Single(
-                            Value::Placeholder(empty()).with_span(Span {
-                                start: peeked_token.span.end,
-                                end: peeked_token.span.end,
-                            }),
+                            Value::Placeholder(String::new()).with_span(Span { start: end, end }),
                         ),
-                    });
-                }
+                    }
+                };
+                parser.push(&mut options, option)?;
             }
             _ => {
-                return parser.expected("another option or end of statement", peeked_token);
+                return parser.expected_ref("another option or end of statement", peeked_token);
             }
         }
     }
     if options.is_empty() {
-        Err(ParserError::ParserError(
-            "expected at least one option".to_string(),
-        ))
+        Err(parser.error(format_args!("expected at least one option")))
     } else {
         Ok(options)
     }
@@ -1833,9 +2019,10 @@ fn parse_multi_table_insert(
 fn parse_multi_table_insert_into_clauses(
     parser: &mut Parser,
 ) -> Result<Vec<MultiTableInsertIntoClause>, ParserError> {
-    let mut into_clauses = vec![];
+    let mut into_clauses = Vec::new();
     while parser.parse_keyword(Keyword::INTO) {
-        into_clauses.push(parse_multi_table_insert_into_clause(parser)?);
+        let into_clause = parse_multi_table_insert_into_clause(parser)?;
+        parser.push(&mut into_clauses, into_clause)?;
     }
     if into_clauses.is_empty() {
         return parser.expected_ref("INTO clause in multi-table INSERT", parser.peek_token_ref());
@@ -1894,7 +2081,7 @@ fn parse_multi_table_insert_when_clauses(
     ),
     ParserError,
 > {
-    let mut when_clauses = vec![];
+    let mut when_clauses = Vec::new();
     let mut else_clause = None;
 
     // Parse WHEN clauses
@@ -1905,10 +2092,13 @@ fn parse_multi_table_insert_when_clauses(
         // Parse INTO clauses for this WHEN
         let into_clauses = parse_multi_table_insert_into_clauses(parser)?;
 
-        when_clauses.push(MultiTableInsertWhenClause {
-            condition,
-            into_clauses,
-        });
+        parser.push(
+            &mut when_clauses,
+            MultiTableInsertWhenClause {
+                condition,
+                into_clauses,
+            },
+        )?;
     }
 
     // Parse optional ELSE clause

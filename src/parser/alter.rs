@@ -13,7 +13,7 @@
 //! SQL Parser for ALTER
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::ToString, vec};
+use alloc::vec;
 
 use super::{Parser, ParserError};
 use crate::{
@@ -268,10 +268,10 @@ impl Parser<'_> {
         };
 
         let unset_tag = if self.parse_keywords(&[Keyword::UNSET, Keyword::TAG]) {
-            self.parse_comma_separated(Parser::parse_identifier)?
-                .iter()
-                .map(|i| i.to_string())
-                .collect()
+            let before = self.kept.get();
+            let idents = self.parse_comma_separated(Parser::parse_identifier)?;
+            let held = self.kept.get() - before;
+            self.displayed(idents, held)?
         } else {
             vec![]
         };
@@ -286,10 +286,10 @@ impl Parser<'_> {
         };
 
         let unset_props = if self.parse_keyword(Keyword::UNSET) {
-            self.parse_comma_separated(Parser::parse_identifier)?
-                .iter()
-                .map(|i| i.to_string())
-                .collect()
+            let before = self.kept.get();
+            let idents = self.parse_comma_separated(Parser::parse_identifier)?;
+            let held = self.kept.get() - before;
+            self.displayed(idents, held)?
         } else {
             vec![]
         };
@@ -375,7 +375,9 @@ impl Parser<'_> {
 
         // [ IN DATABASE _`database_name`_ ]
         let in_database = if self.parse_keywords(&[Keyword::IN, Keyword::DATABASE]) {
-            self.parse_object_name(false).ok()
+            let before = self.kept.get();
+            let made = self.parse_object_name(false);
+            self.optional(before, made)?
         } else {
             None
         };
@@ -405,14 +407,17 @@ impl Parser<'_> {
                         config_value: SetConfigValue::Default,
                         in_database,
                     }
-                } else if let Ok(expr) = self.parse_expr() {
-                    AlterRoleOperation::Set {
-                        config_name,
-                        config_value: SetConfigValue::Value(expr),
-                        in_database,
-                    }
                 } else {
-                    self.expected_ref("config value", self.peek_token_ref())?
+                    let before = self.kept.get();
+                    let made = self.parse_expr();
+                    match self.optional(before, made)? {
+                        Some(expr) => AlterRoleOperation::Set {
+                            config_name,
+                            config_value: SetConfigValue::Value(expr),
+                            in_database,
+                        },
+                        None => self.expected_ref("config value", self.peek_token_ref())?,
+                    }
                 }
             } else {
                 self.expected_ref("'TO' or '=' or 'FROM CURRENT'", self.peek_token_ref())?
@@ -438,7 +443,7 @@ impl Parser<'_> {
             // option
             let mut options = vec![];
             while let Some(opt) = self.maybe_parse(|parser| parser.parse_pg_role_option())? {
-                options.push(opt);
+                self.push(&mut options, opt)?;
             }
             // check option
             if options.is_empty() {
