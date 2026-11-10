@@ -174,6 +174,7 @@ pub mod dialect;
 #[cfg(feature = "derive-dialect")]
 pub use dialect::derive_dialect;
 mod display_utils;
+mod funding;
 pub mod keywords;
 pub mod parser;
 pub mod tokenizer;

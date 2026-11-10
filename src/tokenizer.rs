@@ -44,6 +44,7 @@ use crate::dialect::{
     BigQueryDialect, DuckDbDialect, GenericDialect, MySqlDialect, PostgreSqlDialect,
     SnowflakeDialect,
 };
+use crate::funding::{Funding, Held, Refused, UNFUNDED};
 use crate::keywords::{Keyword, ALL_KEYWORDS, ALL_KEYWORDS_INDEX};
 use crate::{
     ast::{DollarQuotedString, QuoteDelimitedString},
@@ -844,147 +845,7 @@ pub trait TokenizerFunding {
     fn discharge(&self, bytes: usize);
 }
 
-/// Funding that refuses nothing: allocations the allocator refuses still fail as
-/// [`TokenizerErrorKind::OutOfMemory`] rather than abort.
-struct Unfunded;
-
-impl TokenizerFunding for Unfunded {
-    fn charge(&self, _bytes: usize) -> bool {
-        true
-    }
-
-    fn discharge(&self, _bytes: usize) {}
-}
-
-static UNFUNDED: Unfunded = Unfunded;
-
-/// A buffer the tokenizer grows: room for its items is charged before it is allocated.
-trait Buffer: Default {
-    /// The bytes one item takes.
-    const ITEM: usize;
-    fn filled(&self) -> usize;
-    fn room(&self) -> usize;
-    /// Room for exactly `additional` more items than it holds; `false`, and nothing allocated,
-    /// if the allocator refused it.
-    fn grow_exact(&mut self, additional: usize) -> bool;
-}
-
-impl Buffer for String {
-    const ITEM: usize = 1;
-
-    fn filled(&self) -> usize {
-        self.len()
-    }
-
-    fn room(&self) -> usize {
-        self.capacity()
-    }
-
-    fn grow_exact(&mut self, additional: usize) -> bool {
-        self.try_reserve_exact(additional).is_ok()
-    }
-}
-
-impl<T> Buffer for Vec<T> {
-    const ITEM: usize = core::mem::size_of::<T>();
-
-    fn filled(&self) -> usize {
-        self.len()
-    }
-
-    fn room(&self) -> usize {
-        self.capacity()
-    }
-
-    fn grow_exact(&mut self, additional: usize) -> bool {
-        self.try_reserve_exact(additional).is_ok()
-    }
-}
-
-/// Counts the bytes a text is written in, allocating nothing.
-struct Measure(usize);
-
-impl fmt::Write for Measure {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0 += s.len();
-        Ok(())
-    }
-}
-
-/// The tokenizer's funding, through which it makes everything it allocates.
-#[derive(Clone, Copy)]
-struct Funding<'f>(&'f dyn TokenizerFunding);
-
-impl<'f> Funding<'f> {
-    /// Room for `additional` more items in `buffer`, the whole block it grows into charged before
-    /// it is allocated (the block it grew out of is freed only once that is), and the block it
-    /// grew out of given back once it is freed. Its room at least doubles as it grows.
-    fn reserve<B: Buffer>(self, buffer: &mut B, additional: usize) -> Result<(), TokenizerError> {
-        let (filled, room) = (buffer.filled(), buffer.room());
-        if room - filled >= additional {
-            return Ok(());
-        }
-        let wanted = filled
-            .checked_add(additional)
-            .ok_or_else(TokenizerError::out_of_memory)?;
-        let grown = wanted.max(room.saturating_mul(2)).max(8);
-        let bytes = grown
-            .checked_mul(B::ITEM)
-            .ok_or_else(TokenizerError::out_of_memory)?;
-        if !self.0.charge(bytes) {
-            return Err(TokenizerError::out_of_memory());
-        }
-        if !buffer.grow_exact(grown - filled) {
-            self.0.discharge(bytes);
-            return Err(TokenizerError::out_of_memory());
-        }
-        self.0.discharge(room * B::ITEM);
-        Ok(())
-    }
-
-    /// An empty text, allocating nothing until it grows.
-    fn text(self) -> Held<'f, String> {
-        Held {
-            buffer: String::new(),
-            funding: self,
-        }
-    }
-
-    /// An empty list, allocating nothing until it grows.
-    fn list<T>(self) -> Held<'f, Vec<T>> {
-        Held {
-            buffer: Vec::new(),
-            funding: self,
-        }
-    }
-
-    fn string(self, text: &str) -> Result<Held<'f, String>, TokenizerError> {
-        let mut made = self.text();
-        made.push_str(text)?;
-        Ok(made)
-    }
-
-    fn chars(
-        self,
-        chars: impl IntoIterator<Item = char>,
-    ) -> Result<Held<'f, String>, TokenizerError> {
-        let mut made = self.text();
-        for ch in chars {
-            made.push_char(ch)?;
-        }
-        Ok(made)
-    }
-
-    /// `args` written out, measured first so exactly its bytes are charged and allocated.
-    fn format(self, args: fmt::Arguments<'_>) -> Result<Held<'f, String>, TokenizerError> {
-        let mut measure = Measure(0);
-        fmt::write(&mut measure, args).map_err(|_| TokenizerError::out_of_memory())?;
-        let mut made = self.text();
-        made.reserve(measure.0)?;
-        fmt::write(&mut made.buffer, args).map_err(|_| TokenizerError::out_of_memory())?;
-        Ok(made)
-    }
-
+impl Funding<'_> {
     /// The syntax error at `location`, its message charged before it is made: out of memory if
     /// that is refused. The message's charge goes with the error, to be given back by whoever
     /// frees it.
@@ -995,70 +856,14 @@ impl<'f> Funding<'f> {
                 location,
                 kind: TokenizerErrorKind::Syntax,
             },
-            Err(error) => error,
+            Err(refused) => refused.into(),
         }
     }
 }
 
-/// A buffer the tokenizer is growing, its room charged to its funding: given back as it is
-/// freed, unless it is kept by what the tokenizer makes.
-struct Held<'f, B: Buffer> {
-    buffer: B,
-    funding: Funding<'f>,
-}
-
-impl<B: Buffer> Held<'_, B> {
-    fn reserve(&mut self, additional: usize) -> Result<(), TokenizerError> {
-        self.funding.reserve(&mut self.buffer, additional)
-    }
-
-    /// The buffer, its charge going with it: whoever frees it gives that back.
-    fn keep(mut self) -> B {
-        core::mem::take(&mut self.buffer)
-    }
-}
-
-impl Held<'_, String> {
-    fn push_char(&mut self, ch: char) -> Result<(), TokenizerError> {
-        self.reserve(ch.len_utf8())?;
-        self.buffer.push(ch);
-        Ok(())
-    }
-
-    fn push_str(&mut self, more: &str) -> Result<(), TokenizerError> {
-        self.reserve(more.len())?;
-        self.buffer.push_str(more);
-        Ok(())
-    }
-
-    /// Shortened to `len` bytes, keeping its room.
-    fn truncate(&mut self, len: usize) {
-        self.buffer.truncate(len);
-    }
-}
-
-impl<T> Held<'_, Vec<T>> {
-    fn push(&mut self, item: T) -> Result<(), TokenizerError> {
-        self.reserve(1)?;
-        self.buffer.push(item);
-        Ok(())
-    }
-}
-
-impl<B: Buffer> core::ops::Deref for Held<'_, B> {
-    type Target = B;
-
-    fn deref(&self) -> &B {
-        &self.buffer
-    }
-}
-
-impl<B: Buffer> Drop for Held<'_, B> {
-    fn drop(&mut self) {
-        let bytes = self.buffer.room() * B::ITEM;
-        if bytes > 0 {
-            self.funding.0.discharge(bytes);
-        }
+impl From<Refused> for TokenizerError {
+    fn from(_: Refused) -> Self {
+        Self::out_of_memory()
     }
 }
 
