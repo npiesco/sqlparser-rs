@@ -12695,10 +12695,9 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::TEXT => {
                     if let Some(modifiers) = self.parse_optional_type_modifiers()? {
-                        Ok(DataType::Custom(
-                            ObjectName::from(vec![Ident::new("TEXT")]),
-                            modifiers,
-                        ))
+                        let text = Ident::new(self.string("TEXT")?);
+                        let text = self.vec_of([text])?;
+                        Ok(DataType::Custom(self.object_name(text)?, modifiers))
                     } else {
                         Ok(DataType::Text)
                     }
@@ -12749,9 +12748,9 @@ impl<'a> Parser<'a> {
                         self.expect_token(&Token::Lt)?;
                         let (inside_type, _trailing_bracket) = self.parse_data_type_helper()?;
                         trailing_bracket = self.expect_closing_angle_bracket(_trailing_bracket)?;
-                        Ok(DataType::Array(ArrayElemTypeDef::AngleBracket(Box::new(
-                            inside_type,
-                        ))))
+                        Ok(DataType::Array(ArrayElemTypeDef::AngleBracket(
+                            self.boxed(inside_type)?,
+                        )))
                     }
                 }
                 Keyword::STRUCT if dialect_is!(dialect is DuckDbDialect) => {
@@ -12787,16 +12786,16 @@ impl<'a> Parser<'a> {
                     let (value_data_type, _trailing_bracket) = self.parse_data_type_helper()?;
                     trailing_bracket = self.expect_closing_angle_bracket(_trailing_bracket)?;
                     Ok(DataType::Map(
-                        Box::new(key_data_type),
-                        Box::new(value_data_type),
+                        self.boxed(key_data_type)?,
+                        self.boxed(value_data_type)?,
                     ))
                 }
                 Keyword::MAP if dialect_is!(dialect is ClickHouseDialect | GenericDialect) => {
                     self.prev_token();
                     let (key_data_type, value_data_type) = self.parse_click_house_map_def()?;
                     Ok(DataType::Map(
-                        Box::new(key_data_type),
-                        Box::new(value_data_type),
+                        self.boxed(key_data_type)?,
+                        self.boxed(value_data_type)?,
                     ))
                 }
                 Keyword::NESTED if dialect_is!(dialect is ClickHouseDialect | GenericDialect) => {
@@ -12863,7 +12862,7 @@ impl<'a> Parser<'a> {
                 // Parse optional array data type size
                 let size = self.maybe_parse(|p| p.parse_literal_uint())?;
                 self.expect_token(&Token::RBracket)?;
-                data = DataType::Array(ArrayElemTypeDef::SquareBracket(Box::new(data), size))
+                data = DataType::Array(ArrayElemTypeDef::SquareBracket(self.boxed(data)?, size))
             }
         }
         Ok((data, trailing_bracket))
@@ -13280,11 +13279,11 @@ impl<'a> Parser<'a> {
         in_table_clause: bool,
         allow_wildcards: bool,
     ) -> Result<ObjectName, ParserError> {
-        let mut parts = vec![];
+        let mut parts = Vec::new();
         if dialect_of!(self is BigQueryDialect) && in_table_clause {
             loop {
                 let (ident, end_with_period) = self.parse_unquoted_hyphenated_identifier()?;
-                parts.push(ObjectNamePart::Identifier(ident));
+                self.push(&mut parts, ObjectNamePart::Identifier(ident))?;
                 if !self.consume_token(&Token::Period) && !end_with_period {
                     break;
                 }
@@ -13292,15 +13291,17 @@ impl<'a> Parser<'a> {
         } else {
             loop {
                 if allow_wildcards && self.peek_token_ref().token == Token::Mul {
-                    let span = self.next_token().span;
-                    parts.push(ObjectNamePart::Identifier(Ident {
-                        value: Token::Mul.to_string(),
+                    self.advance_token();
+                    let span = self.get_current_token().span;
+                    let ident = Ident {
+                        value: self.string("*")?,
                         quote_style: None,
                         span,
-                    }));
+                    };
+                    self.push(&mut parts, ObjectNamePart::Identifier(ident))?;
                 } else if dialect_of!(self is BigQueryDialect) && in_table_clause {
                     let (ident, end_with_period) = self.parse_unquoted_hyphenated_identifier()?;
-                    parts.push(ObjectNamePart::Identifier(ident));
+                    self.push(&mut parts, ObjectNamePart::Identifier(ident))?;
                     if !self.consume_token(&Token::Period) && !end_with_period {
                         break;
                     }
@@ -13309,7 +13310,10 @@ impl<'a> Parser<'a> {
                     && matches!(self.peek_token_ref().token, Token::Period)
                 {
                     // Empty string here means default schema
-                    parts.push(ObjectNamePart::Identifier(Ident::new("")));
+                    self.push(
+                        &mut parts,
+                        ObjectNamePart::Identifier(Ident::new(String::new())),
+                    )?;
                 } else {
                     let ident = self.parse_identifier()?;
                     let part = if self
@@ -13324,7 +13328,7 @@ impl<'a> Parser<'a> {
                     } else {
                         ObjectNamePart::Identifier(ident)
                     };
-                    parts.push(part);
+                    self.push(&mut parts, part)?;
                 }
 
                 if !self.consume_token(&Token::Period) {
@@ -13341,23 +13345,24 @@ impl<'a> Parser<'a> {
                     .is_some_and(|ident| ident.value.contains('.'))
             })
         {
-            parts = parts
-                .into_iter()
-                .flat_map(|part| match part.as_ident() {
-                    Some(ident) => ident
-                        .value
-                        .split('.')
-                        .map(|value| {
-                            ObjectNamePart::Identifier(Ident {
-                                value: value.into(),
+            let mut split = self.list();
+            self.each(core::mem::take(&mut parts), |part| {
+                match part {
+                    ObjectNamePart::Identifier(ident) => {
+                        for value in ident.value.split('.') {
+                            split.push(ObjectNamePart::Identifier(Ident {
+                                value: self.string(value)?,
                                 quote_style: ident.quote_style,
                                 span: ident.span,
-                            })
-                        })
-                        .collect::<Vec<_>>(),
-                    None => vec![part],
-                })
-                .collect()
+                            }))?;
+                        }
+                        self.released(ident.value);
+                    }
+                    part => split.push(part)?,
+                }
+                Ok(())
+            })?;
+            return Ok(ObjectName(self.keep(split)));
         }
 
         Ok(ObjectName(parts))
@@ -13468,12 +13473,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a simple one-word identifier (possibly quoted, possibly a keyword)
     pub fn parse_identifier(&mut self) -> Result<Ident, ParserError> {
-        let next_token = self.next_token();
-        match next_token.token {
-            Token::Word(w) => Ok(w.into_ident(next_token.span)),
-            Token::SingleQuotedString(s) => Ok(Ident::with_quote('\'', s)),
-            Token::DoubleQuotedString(s) => Ok(Ident::with_quote('\"', s)),
-            _ => self.expected("identifier", next_token),
+        self.advance_token();
+        let next_token = self.get_current_token();
+        match &next_token.token {
+            Token::Word(w) => self.ident(w, next_token.span),
+            Token::SingleQuotedString(s) => Ok(Ident::with_quote('\'', self.string(s)?)),
+            Token::DoubleQuotedString(s) => Ok(Ident::with_quote('\"', self.string(s)?)),
+            _ => self.expected_ref("identifier", next_token),
         }
     }
 
@@ -13929,11 +13935,11 @@ impl<'a> Parser<'a> {
         if self.consume_token(&Token::LParen) {
             let mut modifiers = Vec::new();
             loop {
-                let next_token = self.next_token();
-                match next_token.token {
-                    Token::Word(w) => modifiers.push(w.to_string()),
-                    Token::Number(n, _) => modifiers.push(n),
-                    Token::SingleQuotedString(s) => modifiers.push(s),
+                self.advance_token();
+                let next_token = self.get_current_token();
+                let modifier = match &next_token.token {
+                    Token::Word(w) => self.format(format_args!("{w}"))?,
+                    Token::Number(n, _) | Token::SingleQuotedString(n) => self.string(n)?,
 
                     Token::Comma => {
                         continue;
@@ -13941,8 +13947,9 @@ impl<'a> Parser<'a> {
                     Token::RParen => {
                         break;
                     }
-                    _ => self.expected("type modifiers", next_token)?,
-                }
+                    _ => return self.expected_ref("type modifiers", next_token),
+                };
+                self.push(&mut modifiers, modifier)?;
             }
 
             Ok(Some(modifiers))
@@ -13959,7 +13966,7 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::LParen)?;
         let inside_type = self.parse_data_type()?;
         self.expect_token(&Token::RParen)?;
-        Ok(parent_type(inside_type.into()))
+        Ok(parent_type(self.boxed(inside_type)?))
     }
 
     /// Parse a DELETE statement, returning a `Box`ed SetExpr
@@ -13969,7 +13976,8 @@ impl<'a> Parser<'a> {
         &mut self,
         delete_token: TokenWithSpan,
     ) -> Result<Box<SetExpr>, ParserError> {
-        Ok(Box::new(SetExpr::Delete(self.parse_delete(delete_token)?)))
+        let delete = self.parse_delete(delete_token)?;
+        self.boxed(SetExpr::Delete(delete))
     }
 
     /// Parse a `DELETE` statement and return `Statement::Delete`.
