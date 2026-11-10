@@ -13072,28 +13072,35 @@ impl<'a> Parser<'a> {
     {
         let after_as = self.parse_keyword(Keyword::AS);
 
-        let next_token = self.next_token();
-        match next_token.token {
+        self.advance_token();
+        let at = self.get_current_index();
+        let alias = match &self.token_at(at).token {
             // Accepts a keyword as an alias if the AS keyword explicitly indicate an alias or if the
             // caller provided a list of reserved keywords and the keyword is not on that list.
             Token::Word(w)
                 if reserved_kwds.is_some()
                     && (after_as || reserved_kwds.is_some_and(|x| !x.contains(&w.keyword))) =>
             {
-                Ok(Some(w.into_ident(next_token.span)))
+                true
             }
             // Accepts a keyword as alias based on the caller's context, such as to what SQL element
             // this word is a potential alias of using the validator call-back. This allows for
             // dialect-specific logic.
-            Token::Word(w) if validator(after_as, &w.keyword, self) => {
-                Ok(Some(w.into_ident(next_token.span)))
+            Token::Word(w) => {
+                let keyword = w.keyword;
+                validator(after_as, &keyword, self)
             }
+            _ => false,
+        };
+        let next_token = self.token_at(at);
+        match &next_token.token {
+            Token::Word(w) if alias => Ok(Some(self.ident(w, next_token.span)?)),
             // For backwards-compatibility, we accept quoted strings as aliases regardless of the context.
-            Token::SingleQuotedString(s) => Ok(Some(Ident::with_quote('\'', s))),
-            Token::DoubleQuotedString(s) => Ok(Some(Ident::with_quote('\"', s))),
+            Token::SingleQuotedString(s) => Ok(Some(Ident::with_quote('\'', self.string(s)?))),
+            Token::DoubleQuotedString(s) => Ok(Some(Ident::with_quote('\"', self.string(s)?))),
             _ => {
                 if after_as {
-                    return self.expected("an identifier after AS", next_token);
+                    return self.expected_ref("an identifier after AS", next_token);
                 }
                 self.prev_token();
                 Ok(None) // no alias found
@@ -15890,7 +15897,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_joins(&mut self) -> Result<Vec<Join>, ParserError> {
-        let mut joins = vec![];
+        let mut joins = Vec::new();
         loop {
             let global = self.parse_keyword(Keyword::GLOBAL);
             let join = if self.parse_keyword(Keyword::CROSS) {
@@ -15983,7 +15990,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     kw @ Keyword::LEFT | kw @ Keyword::RIGHT => {
-                        let _ = self.next_token(); // consume LEFT/RIGHT
+                        self.advance_token(); // consume LEFT/RIGHT
                         let is_left = kw == Keyword::LEFT;
                         let join_type = self.parse_one_of_keywords(&[
                             Keyword::OUTER,
@@ -16031,17 +16038,17 @@ impl<'a> Parser<'a> {
                         }
                     }
                     Keyword::ANTI => {
-                        let _ = self.next_token(); // consume ANTI
+                        self.advance_token(); // consume ANTI
                         self.expect_keyword_is(Keyword::JOIN)?;
                         JoinOperator::Anti
                     }
                     Keyword::SEMI => {
-                        let _ = self.next_token(); // consume SEMI
+                        self.advance_token(); // consume SEMI
                         self.expect_keyword_is(Keyword::JOIN)?;
                         JoinOperator::Semi
                     }
                     Keyword::FULL => {
-                        let _ = self.next_token(); // consume FULL
+                        self.advance_token(); // consume FULL
                         let _ = self.parse_keyword(Keyword::OUTER); // [ OUTER ]
                         self.expect_keyword_is(Keyword::JOIN)?;
                         JoinOperator::FullOuter
@@ -16050,7 +16057,7 @@ impl<'a> Parser<'a> {
                         return self.expected_ref("LEFT, RIGHT, or FULL", self.peek_token_ref());
                     }
                     Keyword::STRAIGHT_JOIN => {
-                        let _ = self.next_token(); // consume STRAIGHT_JOIN
+                        self.advance_token(); // consume STRAIGHT_JOIN
                         JoinOperator::StraightJoin
                     }
                     _ if natural => {
@@ -16068,7 +16075,7 @@ impl<'a> Parser<'a> {
                 {
                     let joins = self.parse_joins()?;
                     relation = TableFactor::NestedJoin {
-                        table_with_joins: Box::new(TableWithJoins { relation, joins }),
+                        table_with_joins: self.boxed(TableWithJoins { relation, joins })?,
                         alias: None,
                     };
                 }
@@ -16080,7 +16087,7 @@ impl<'a> Parser<'a> {
                     join_operator: join_operator_type(join_constraint),
                 }
             };
-            joins.push(join);
+            self.push(&mut joins, join)?;
         }
         Ok(joins)
     }
