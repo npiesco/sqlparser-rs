@@ -15,11 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
-
 use crate::ast::BinaryOperator;
-use crate::ast::{Expr, Statement};
+use crate::ast::Statement;
 use crate::dialect::Dialect;
 use crate::keywords::Keyword;
 use crate::parser::{Parser, ParserError};
@@ -69,7 +66,11 @@ impl Dialect for SQLiteDialect {
     fn parse_statement(&self, parser: &mut Parser) -> Option<Result<Statement, ParserError>> {
         if parser.parse_keyword(Keyword::REPLACE) {
             parser.prev_token();
-            Some(parser.parse_insert(parser.get_current_token().clone()))
+            let insert_token = match parser.copied(parser.get_current_token()) {
+                Ok(insert_token) => insert_token,
+                Err(e) => return Some(Err(e)),
+            };
+            Some(parser.parse_insert(insert_token))
         } else {
             None
         }
@@ -88,12 +89,7 @@ impl Dialect for SQLiteDialect {
             (Keyword::MATCH, BinaryOperator::Match),
         ] {
             if parser.parse_keyword(keyword) {
-                let left = Box::new(expr.clone());
-                let right = Box::new(match parser.parse_expr() {
-                    Ok(expr) => expr,
-                    Err(e) => return Some(Err(e)),
-                });
-                return Some(Ok(Expr::BinaryOp { left, op, right }));
+                return Some(parser.lent_infix(expr, op));
             }
         }
         None

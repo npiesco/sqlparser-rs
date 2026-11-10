@@ -21017,6 +21017,21 @@ impl<'a> Parser<'a> {
         Ok(shown)
     }
 
+    /// `left op right`, `right` the expression parsed next, for a dialect's `parse_infix`, which
+    /// is lent `left`: both boxes are charged before they are made. The copy of `left` is not:
+    /// what a deep copy of an expression allocates is not known before it is made, and
+    /// [`Dialect::parse_infix`] lends the left operand instead of handing it over.
+    pub(crate) fn lent_infix(
+        &mut self,
+        left: &Expr,
+        op: BinaryOperator,
+    ) -> Result<Expr, ParserError> {
+        let left = self.boxed(left.clone())?;
+        let right = self.parse_expr()?;
+        let right = self.boxed(right)?;
+        Ok(Expr::BinaryOp { left, op, right })
+    }
+
     /// The number the `Token::Number` at `index` holds, parsed in place.
     fn number_at<T: FromStr>(&self, index: usize, loc: Location) -> Result<T, ParserError>
     where
