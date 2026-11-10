@@ -20986,7 +20986,7 @@ impl<'a> Parser<'a> {
     /// What `made` made, or `None` if it failed to parse: all it made since [`Parser::kept`] was
     /// `before`, the error it failed with included, is freed and given back. A refusal is not a
     /// failed parse: it is returned.
-    fn optional<T>(
+    pub(crate) fn optional<T>(
         &self,
         before: usize,
         made: Result<T, ParserError>,
@@ -21053,7 +21053,7 @@ impl<'a> Parser<'a> {
 
     /// `slot` set to what `make` makes, what it held before freed: `held`, the bytes the value
     /// in `slot` holds, given back and set to what the new value holds.
-    fn replaced<T>(
+    pub(crate) fn replaced<T>(
         &mut self,
         slot: &mut Option<T>,
         held: &mut usize,
@@ -21086,10 +21086,20 @@ impl<'a> Parser<'a> {
     }
 
     /// `value`, made and handed out holding `held` bytes, freed: they are given back.
-    fn freed<T>(&self, value: T, held: usize) {
+    pub(crate) fn freed<T>(&self, value: T, held: usize) {
         drop(value);
         self.kept.set(self.kept.get() - held);
         self.funding.discharge(held);
+    }
+
+    /// `slot` set to `value`, all of it made since [`Parser::kept`] was `before`: the value
+    /// `slot` held before, holding `*held` bytes, freed and given back, and `*held` set to what
+    /// `value` holds.
+    pub(crate) fn set<T>(&self, slot: &mut T, held: &mut usize, before: usize, value: T) {
+        let made = self.kept.get() - before;
+        let was = core::mem::replace(slot, value);
+        self.freed(was, *held);
+        *held = made;
     }
 }
 
