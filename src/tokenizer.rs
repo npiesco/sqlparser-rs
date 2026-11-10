@@ -21,12 +21,11 @@
 //!
 //! The tokens then form the input for the parser, which outputs an Abstract Syntax Tree (AST).
 
+#[cfg(all(test, not(feature = "std")))]
+use alloc::{borrow::ToOwned, format, vec};
 #[cfg(not(feature = "std"))]
 use alloc::{
-    borrow::ToOwned,
-    format,
     string::{String, ToString},
-    vec,
     vec::Vec,
 };
 use core::num::NonZeroU8;
@@ -792,11 +791,303 @@ pub struct TokenizerError {
     pub message: String,
     /// The `Location` where the error was detected.
     pub location: Location,
+    /// What kind of error it is.
+    pub kind: TokenizerErrorKind,
+}
+
+/// What kind of error the tokenizer reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerErrorKind {
+    /// The query is not valid SQL for the dialect.
+    Syntax,
+    /// What the tokenizer had to allocate was refused: by its [`TokenizerFunding`], or by the
+    /// allocator. Nothing was allocated for it, and its `message` is empty.
+    OutOfMemory,
+}
+
+impl TokenizerError {
+    /// The error for an allocation that was refused, itself allocating nothing.
+    pub fn out_of_memory() -> Self {
+        Self {
+            message: String::new(),
+            location: Location::empty(),
+            kind: TokenizerErrorKind::OutOfMemory,
+        }
+    }
+
+    /// Whether what the tokenizer had to allocate was refused.
+    pub fn is_out_of_memory(&self) -> bool {
+        self.kind == TokenizerErrorKind::OutOfMemory
+    }
 }
 
 impl fmt::Display for TokenizerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}{}", self.message, self.location,)
+        match self.kind {
+            TokenizerErrorKind::Syntax => write!(f, "{}{}", self.message, self.location,),
+            TokenizerErrorKind::OutOfMemory => f.write_str("out of memory"),
+        }
+    }
+}
+
+/// What the tokenizer charges each allocation to before it makes it: a buffer it grows, a token's
+/// text, an error's message. Refused, the tokenizer allocates nothing for it and fails with
+/// [`TokenizerErrorKind::OutOfMemory`].
+///
+/// What it charges for text a token keeps stays charged: the tokens outlive the tokenizer, so
+/// their owner gives back what they were charged once it frees them. What the tokenizer frees
+/// itself, a buffer it grew out of or text it made only to read, it discharges as it frees it.
+pub trait TokenizerFunding {
+    /// Charges `bytes` before they are allocated: `false` refuses them.
+    fn charge(&self, bytes: usize) -> bool;
+    /// Gives back `bytes` charged before, now freed.
+    fn discharge(&self, bytes: usize);
+}
+
+/// Funding that refuses nothing: allocations the allocator refuses still fail as
+/// [`TokenizerErrorKind::OutOfMemory`] rather than abort.
+struct Unfunded;
+
+impl TokenizerFunding for Unfunded {
+    fn charge(&self, _bytes: usize) -> bool {
+        true
+    }
+
+    fn discharge(&self, _bytes: usize) {}
+}
+
+static UNFUNDED: Unfunded = Unfunded;
+
+/// A buffer the tokenizer grows: room for its items is charged before it is allocated.
+trait Buffer: Default {
+    /// The bytes one item takes.
+    const ITEM: usize;
+    fn filled(&self) -> usize;
+    fn room(&self) -> usize;
+    /// Room for exactly `additional` more items than it holds; `false`, and nothing allocated,
+    /// if the allocator refused it.
+    fn grow_exact(&mut self, additional: usize) -> bool;
+}
+
+impl Buffer for String {
+    const ITEM: usize = 1;
+
+    fn filled(&self) -> usize {
+        self.len()
+    }
+
+    fn room(&self) -> usize {
+        self.capacity()
+    }
+
+    fn grow_exact(&mut self, additional: usize) -> bool {
+        self.try_reserve_exact(additional).is_ok()
+    }
+}
+
+impl<T> Buffer for Vec<T> {
+    const ITEM: usize = core::mem::size_of::<T>();
+
+    fn filled(&self) -> usize {
+        self.len()
+    }
+
+    fn room(&self) -> usize {
+        self.capacity()
+    }
+
+    fn grow_exact(&mut self, additional: usize) -> bool {
+        self.try_reserve_exact(additional).is_ok()
+    }
+}
+
+/// Counts the bytes a text is written in, allocating nothing.
+struct Measure(usize);
+
+impl fmt::Write for Measure {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0 += s.len();
+        Ok(())
+    }
+}
+
+/// The tokenizer's funding, through which it makes everything it allocates.
+#[derive(Clone, Copy)]
+struct Funding<'f>(&'f dyn TokenizerFunding);
+
+impl<'f> Funding<'f> {
+    /// Room for `additional` more items in `buffer`, the whole block it grows into charged before
+    /// it is allocated (the block it grew out of is freed only once that is), and the block it
+    /// grew out of given back once it is freed. Its room at least doubles as it grows.
+    fn reserve<B: Buffer>(self, buffer: &mut B, additional: usize) -> Result<(), TokenizerError> {
+        let (filled, room) = (buffer.filled(), buffer.room());
+        if room - filled >= additional {
+            return Ok(());
+        }
+        let wanted = filled
+            .checked_add(additional)
+            .ok_or_else(TokenizerError::out_of_memory)?;
+        let grown = wanted.max(room.saturating_mul(2)).max(8);
+        let bytes = grown
+            .checked_mul(B::ITEM)
+            .ok_or_else(TokenizerError::out_of_memory)?;
+        if !self.0.charge(bytes) {
+            return Err(TokenizerError::out_of_memory());
+        }
+        if !buffer.grow_exact(grown - filled) {
+            self.0.discharge(bytes);
+            return Err(TokenizerError::out_of_memory());
+        }
+        self.0.discharge(room * B::ITEM);
+        Ok(())
+    }
+
+    /// An empty text, allocating nothing until it grows.
+    fn text(self) -> Held<'f, String> {
+        Held {
+            buffer: String::new(),
+            funding: self,
+        }
+    }
+
+    /// An empty list, allocating nothing until it grows.
+    fn list<T>(self) -> Held<'f, Vec<T>> {
+        Held {
+            buffer: Vec::new(),
+            funding: self,
+        }
+    }
+
+    fn string(self, text: &str) -> Result<Held<'f, String>, TokenizerError> {
+        let mut made = self.text();
+        made.push_str(text)?;
+        Ok(made)
+    }
+
+    fn chars(
+        self,
+        chars: impl IntoIterator<Item = char>,
+    ) -> Result<Held<'f, String>, TokenizerError> {
+        let mut made = self.text();
+        for ch in chars {
+            made.push_char(ch)?;
+        }
+        Ok(made)
+    }
+
+    /// `args` written out, measured first so exactly its bytes are charged and allocated.
+    fn format(self, args: fmt::Arguments<'_>) -> Result<Held<'f, String>, TokenizerError> {
+        let mut measure = Measure(0);
+        fmt::write(&mut measure, args).map_err(|_| TokenizerError::out_of_memory())?;
+        let mut made = self.text();
+        made.reserve(measure.0)?;
+        fmt::write(&mut made.buffer, args).map_err(|_| TokenizerError::out_of_memory())?;
+        Ok(made)
+    }
+
+    /// The syntax error at `location`, its message charged before it is made: out of memory if
+    /// that is refused. The message's charge goes with the error, to be given back by whoever
+    /// frees it.
+    fn error(self, location: Location, message: fmt::Arguments<'_>) -> TokenizerError {
+        match self.format(message) {
+            Ok(message) => TokenizerError {
+                message: message.keep(),
+                location,
+                kind: TokenizerErrorKind::Syntax,
+            },
+            Err(error) => error,
+        }
+    }
+}
+
+/// A buffer the tokenizer is growing, its room charged to its funding: given back as it is
+/// freed, unless it is kept by what the tokenizer makes.
+struct Held<'f, B: Buffer> {
+    buffer: B,
+    funding: Funding<'f>,
+}
+
+impl<B: Buffer> Held<'_, B> {
+    fn reserve(&mut self, additional: usize) -> Result<(), TokenizerError> {
+        self.funding.reserve(&mut self.buffer, additional)
+    }
+
+    /// The buffer, its charge going with it: whoever frees it gives that back.
+    fn keep(mut self) -> B {
+        core::mem::take(&mut self.buffer)
+    }
+}
+
+impl Held<'_, String> {
+    fn push_char(&mut self, ch: char) -> Result<(), TokenizerError> {
+        self.reserve(ch.len_utf8())?;
+        self.buffer.push(ch);
+        Ok(())
+    }
+
+    fn push_str(&mut self, more: &str) -> Result<(), TokenizerError> {
+        self.reserve(more.len())?;
+        self.buffer.push_str(more);
+        Ok(())
+    }
+
+    /// Shortened to `len` bytes, keeping its room.
+    fn truncate(&mut self, len: usize) {
+        self.buffer.truncate(len);
+    }
+}
+
+impl<T> Held<'_, Vec<T>> {
+    fn push(&mut self, item: T) -> Result<(), TokenizerError> {
+        self.reserve(1)?;
+        self.buffer.push(item);
+        Ok(())
+    }
+}
+
+impl<B: Buffer> core::ops::Deref for Held<'_, B> {
+    type Target = B;
+
+    fn deref(&self) -> &B {
+        &self.buffer
+    }
+}
+
+impl<B: Buffer> Drop for Held<'_, B> {
+    fn drop(&mut self) {
+        let bytes = self.buffer.room() * B::ITEM;
+        if bytes > 0 {
+            self.funding.0.discharge(bytes);
+        }
+    }
+}
+
+/// Up to 32 bytes of digits read for an escape, kept where they are read rather than allocated.
+struct Digits {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl Digits {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 32],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, ch: char) {
+        let len = ch.len_utf8();
+        ch.encode_utf8(&mut self.bytes[self.len..self.len + len]);
+        self.len += len;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
     }
 }
 
@@ -872,6 +1163,9 @@ pub struct Tokenizer<'a> {
     /// If true (the default), the tokenizer will un-escape literal
     /// SQL strings See [`Tokenizer::with_unescape`] for more details.
     unescape: bool,
+    /// What everything the tokenizer allocates is charged to before it is allocated.
+    /// See [`Tokenizer::with_funding`].
+    funding: &'a dyn TokenizerFunding,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -896,6 +1190,7 @@ impl<'a> Tokenizer<'a> {
             dialect,
             query,
             unescape: true,
+            funding: &UNFUNDED,
         }
     }
 
@@ -934,21 +1229,51 @@ impl<'a> Tokenizer<'a> {
         self
     }
 
+    /// Set what everything the tokenizer allocates is charged to before it is allocated.
+    ///
+    /// Each buffer the tokenizer grows, each token's text and each error's message is charged
+    /// to `funding` before it is allocated; refused, nothing is allocated for it and tokenizing
+    /// fails with [`TokenizerErrorKind::OutOfMemory`]. Allocations the allocator refuses fail
+    /// the same way, rather than abort, whatever the funding.
+    ///
+    /// What the tokenizer frees itself it gives back to `funding` as it frees it. What it hands
+    /// on stays charged: the room of the buffer tokens are written into (which must hold only
+    /// what was charged to `funding`), the text the tokens keep, and an error's message. Whoever
+    /// frees those gives back what they were charged.
+    pub fn with_funding(mut self, funding: &'a dyn TokenizerFunding) -> Self {
+        self.funding = funding;
+        self
+    }
+
+    fn funding(&self) -> Funding<'a> {
+        Funding(self.funding)
+    }
+
     /// Tokenize the statement and produce a vector of tokens
     pub fn tokenize(&mut self) -> Result<Vec<Token>, TokenizerError> {
-        let twl = self.tokenize_with_location()?;
-        Ok(twl.into_iter().map(|t| t.token).collect())
+        let funding = self.funding();
+        let mut with_location = funding.list();
+        self.tokenize_with_location_into_buf(&mut with_location.buffer)?;
+        let mut tokens = funding.list();
+        tokens.reserve(with_location.len())?;
+        for TokenWithSpan { token, .. } in with_location.buffer.drain(..) {
+            tokens.push(token)?;
+        }
+        Ok(tokens.keep())
     }
 
     /// Tokenize the statement and produce a vector of tokens with location information
     pub fn tokenize_with_location(&mut self) -> Result<Vec<TokenWithSpan>, TokenizerError> {
-        let mut tokens: Vec<TokenWithSpan> = vec![];
-        self.tokenize_with_location_into_buf(&mut tokens)
-            .map(|_| tokens)
+        let mut tokens = self.funding().list();
+        self.tokenize_with_location_into_buf(&mut tokens.buffer)?;
+        Ok(tokens.keep())
     }
 
     /// Tokenize the statement and append tokens with location information into the provided buffer.
     /// If an error is thrown, the buffer will contain all tokens that were successfully parsed before the error.
+    ///
+    /// The buffer's room is grown through the tokenizer's funding (see
+    /// [`Tokenizer::with_funding`]), so what it already holds must have been charged to it.
     pub fn tokenize_with_location_into_buf(
         &mut self,
         buf: &mut Vec<TokenWithSpan>,
@@ -969,20 +1294,32 @@ impl<'a> Tokenizer<'a> {
             col: 1,
         };
 
+        let funding = self.funding();
         let mut location = state.location();
-        while let Some(token) = self.next_token(&mut state, buf.last().map(|t| &t.token))? {
+        loop {
+            // Room for the token is charged and made before the token is, so a token made is
+            // never dropped for want of room.
+            funding.reserve(buf, 1)?;
+            let Some(token) = self.next_token(&mut state, buf.last().map(|t| &t.token))? else {
+                break;
+            };
             let span = location.span_to(state.location());
 
             // Check if this is a multiline comment hint that should be expanded
-            match &token {
+            match token {
                 Token::Whitespace(Whitespace::MultiLineComment(comment))
                     if self.dialect.supports_multiline_comment_hints()
                         && comment.starts_with('!') =>
                 {
+                    // The comment is not kept: its text is given back once it is freed.
+                    let comment = Held {
+                        buffer: comment,
+                        funding,
+                    };
                     // Re-tokenize the hints and add them to the buffer
-                    self.tokenize_comment_hints(comment, span, buf, &mut mapper)?;
+                    self.tokenize_comment_hints(&comment, span, buf, &mut mapper)?;
                 }
-                _ => {
+                token => {
                     buf.push(mapper(TokenWithSpan { token, span }));
                 }
             }
@@ -1013,7 +1350,9 @@ impl<'a> Tokenizer<'a> {
         }
 
         // Create a new tokenizer for the hint content
-        let inner = Tokenizer::new(self.dialect, hint_content).with_unescape(self.unescape);
+        let inner = Tokenizer::new(self.dialect, hint_content)
+            .with_unescape(self.unescape)
+            .with_funding(self.funding);
 
         // Create a state for tracking position within the hint
         let mut state = State {
@@ -1023,8 +1362,13 @@ impl<'a> Tokenizer<'a> {
         };
 
         // Tokenize the hint content and add tokens to the buffer
+        let funding = self.funding();
         let mut location = state.location();
-        while let Some(token) = inner.next_token(&mut state, buf.last().map(|t| &t.token))? {
+        loop {
+            funding.reserve(buf, 1)?;
+            let Some(token) = inner.next_token(&mut state, buf.last().map(|t| &t.token))? else {
+                break;
+            };
             let token_span = location.span_to(state.location());
             buf.push(mapper(TokenWithSpan {
                 token,
@@ -1043,23 +1387,17 @@ impl<'a> Tokenizer<'a> {
         chars: &mut State,
     ) -> Result<Option<Token>, TokenizerError> {
         chars.next(); // consume the first char
-        let ch: String = ch.into_iter().collect();
-        let word = self.tokenize_word(ch, chars);
+        let mut word = self.tokenize_word(ch, chars)?;
 
         // TODO: implement parsing of exponent here
         if word.chars().all(|x| x.is_ascii_digit() || x == '.') {
-            let mut inner_state = State {
-                peekable: word.chars().peekable(),
-                line: 0,
-                col: 0,
-            };
-            let mut s = peeking_take_while(&mut inner_state, |ch| matches!(ch, '0'..='9' | '.'));
-            let s2 = peeking_take_while(chars, |ch| matches!(ch, '0'..='9' | '.'));
-            s += s2.as_str();
-            return Ok(Some(Token::Number(s, false)));
+            // The word is all digits and periods: the number is it and the digits and periods
+            // that follow it.
+            take_while_into(&mut word, chars, |ch| matches!(ch, '0'..='9' | '.'))?;
+            return Ok(Some(Token::Number(word.keep(), false)));
         }
 
-        Ok(Some(Token::make_word_owned(word, None)))
+        Ok(Some(Token::make_word_owned(word.keep(), None)))
     }
 
     /// Get the next token or return None
@@ -1116,8 +1454,8 @@ impl<'a> Tokenizer<'a> {
                         }
                         _ => {
                             // regular identifier starting with an "b" or "B"
-                            let s = self.tokenize_word(b, chars);
-                            Ok(Some(Token::make_word_owned(s, None)))
+                            let s = self.tokenize_word([b], chars)?;
+                            Ok(Some(Token::make_word_owned(s.keep(), None)))
                         }
                     }
                 }
@@ -1143,8 +1481,8 @@ impl<'a> Tokenizer<'a> {
                             ),
                         _ => {
                             // regular identifier starting with an "r" or "R"
-                            let s = self.tokenize_word(b, chars);
-                            Ok(Some(Token::make_word_owned(s, None)))
+                            let s = self.tokenize_word([b], chars)?;
+                            Ok(Some(Token::make_word_owned(s.keep(), None)))
                         }
                     }
                 }
@@ -1168,14 +1506,14 @@ impl<'a> Tokenizer<'a> {
                                 self.tokenize_quote_delimited_string(chars, &[n, q])
                                     .map(|s| Some(Token::NationalQuoteDelimitedStringLiteral(s)))
                             } else {
-                                let s = self.tokenize_word(String::from_iter([n, q]), chars);
-                                Ok(Some(Token::make_word_owned(s, None)))
+                                let s = self.tokenize_word([n, q], chars)?;
+                                Ok(Some(Token::make_word_owned(s.keep(), None)))
                             }
                         }
                         _ => {
                             // regular identifier starting with an "N"
-                            let s = self.tokenize_word(n, chars);
-                            Ok(Some(Token::make_word_owned(s, None)))
+                            let s = self.tokenize_word([n], chars)?;
+                            Ok(Some(Token::make_word_owned(s.keep(), None)))
                         }
                     }
                 }
@@ -1185,8 +1523,8 @@ impl<'a> Tokenizer<'a> {
                         self.tokenize_quote_delimited_string(chars, &[q])
                             .map(|s| Some(Token::QuoteDelimitedStringLiteral(s)))
                     } else {
-                        let s = self.tokenize_word(q, chars);
-                        Ok(Some(Token::make_word_owned(s, None)))
+                        let s = self.tokenize_word([q], chars)?;
+                        Ok(Some(Token::make_word_owned(s.keep(), None)))
                     }
                 }
                 // PostgreSQL accepts "escape" string constants, which are an extension to the SQL standard.
@@ -1201,8 +1539,8 @@ impl<'a> Tokenizer<'a> {
                         }
                         _ => {
                             // regular identifier starting with an "E" or "e"
-                            let s = self.tokenize_word(x, chars);
-                            Ok(Some(Token::make_word_owned(s, None)))
+                            let s = self.tokenize_word([x], chars)?;
+                            Ok(Some(Token::make_word_owned(s.keep(), None)))
                         }
                     }
                 }
@@ -1215,13 +1553,13 @@ impl<'a> Tokenizer<'a> {
                         chars_clone.next(); // consume the '&' in the clone
                         if chars_clone.peek() == Some(&'\'') {
                             chars.next(); // consume the '&' in the original iterator
-                            let s = unescape_unicode_single_quoted_string(chars)?;
+                            let s = unescape_unicode_single_quoted_string(self.funding(), chars)?;
                             return Ok(Some(Token::UnicodeStringLiteral(s)));
                         }
                     }
                     // regular identifier starting with an "U" or "u"
-                    let s = self.tokenize_word(x, chars);
-                    Ok(Some(Token::make_word_owned(s, None)))
+                    let s = self.tokenize_word([x], chars)?;
+                    Ok(Some(Token::make_word_owned(s.keep(), None)))
                 }
                 // The spec only allows an uppercase 'X' to introduce a hex
                 // string, but PostgreSQL, at least, allows a lowercase 'x' too.
@@ -1235,8 +1573,8 @@ impl<'a> Tokenizer<'a> {
                         }
                         _ => {
                             // regular identifier starting with an "X"
-                            let s = self.tokenize_word(x, chars);
-                            Ok(Some(Token::make_word_owned(s, None)))
+                            let s = self.tokenize_word([x], chars)?;
+                            Ok(Some(Token::make_word_owned(s.keep(), None)))
                         }
                     }
                 }
@@ -1285,7 +1623,7 @@ impl<'a> Tokenizer<'a> {
                 // delimited (quoted) identifier
                 quote_start if self.dialect.is_delimited_identifier_start(ch) => {
                     let word = self.tokenize_quoted_identifier(quote_start, chars)?;
-                    Ok(Some(Token::make_word_owned(word, Some(quote_start))))
+                    Ok(Some(Token::make_word_owned(word.keep(), Some(quote_start))))
                 }
                 // Potentially nested delimited (quoted) identifier
                 quote_start
@@ -1303,44 +1641,43 @@ impl<'a> Tokenizer<'a> {
                     else {
                         return self.tokenizer_error(
                             chars.location(),
-                            format!("Expected nested delimiter '{quote_start}' before EOF."),
+                            format_args!("Expected nested delimiter '{quote_start}' before EOF."),
                         );
                     };
 
                     let Some(nested_quote_start) = nested_quote_start else {
                         let word = self.tokenize_quoted_identifier(quote_start, chars)?;
-                        return Ok(Some(Token::make_word_owned(word, Some(quote_start))));
+                        return Ok(Some(Token::make_word_owned(word.keep(), Some(quote_start))));
                     };
 
-                    let mut word = vec![];
+                    let mut word = self.funding().text();
                     let quote_end = Word::matching_end_quote(quote_start);
                     let nested_quote_end = Word::matching_end_quote(nested_quote_start);
                     let error_loc = chars.location();
 
                     chars.next(); // skip the first delimiter
-                    peeking_take_while(chars, |ch| ch.is_whitespace());
+                    skip_while(chars, |ch| ch.is_whitespace());
                     if chars.peek() != Some(&nested_quote_start) {
                         return self.tokenizer_error(
                             error_loc,
-                            format!("Expected nested delimiter '{nested_quote_start}' before EOF."),
+                            format_args!(
+                                "Expected nested delimiter '{nested_quote_start}' before EOF."
+                            ),
                         );
                     }
-                    word.push(nested_quote_start.into());
-                    word.push(self.tokenize_quoted_identifier(nested_quote_end, chars)?);
-                    word.push(nested_quote_end.into());
-                    peeking_take_while(chars, |ch| ch.is_whitespace());
+                    word.push_char(nested_quote_start)?;
+                    word.push_str(&self.tokenize_quoted_identifier(nested_quote_end, chars)?)?;
+                    word.push_char(nested_quote_end)?;
+                    skip_while(chars, |ch| ch.is_whitespace());
                     if chars.peek() != Some(&quote_end) {
                         return self.tokenizer_error(
                             error_loc,
-                            format!("Expected close delimiter '{quote_end}' before EOF."),
+                            format_args!("Expected close delimiter '{quote_end}' before EOF."),
                         );
                     }
                     chars.next(); // skip close delimiter
 
-                    Ok(Some(Token::make_word_owned(
-                        word.concat(),
-                        Some(quote_start),
-                    )))
+                    Ok(Some(Token::make_word_owned(word.keep(), Some(quote_start))))
                 }
                 // numbers and period
                 '0'..='9' | '.' => {
@@ -1356,7 +1693,7 @@ impl<'a> Tokenizer<'a> {
 
                         return self.tokenizer_error(
                             chars.location(),
-                            "Unexpected character '_'".to_string(),
+                            format_args!("Unexpected character '_'"),
                         );
                     }
 
@@ -1368,22 +1705,23 @@ impl<'a> Tokenizer<'a> {
                             && next_char.is_some_and(|next_ch| next_ch.is_ascii_hexdigit())
                     };
 
-                    let mut s = peeking_next_take_while(chars, |ch, next_ch| {
+                    let funding = self.funding();
+                    let mut s = peeking_next_take_while(funding, chars, |ch, next_ch| {
                         ch.is_ascii_digit() || is_number_separator(ch, next_ch)
-                    });
+                    })?;
 
                     // match binary literal that starts with 0x
-                    if s == "0" && chars.peek() == Some(&'x') {
+                    if s.as_str() == "0" && chars.peek() == Some(&'x') {
                         chars.next();
-                        let s2 = peeking_next_take_while(chars, |ch, next_ch| {
+                        let s2 = peeking_next_take_while(funding, chars, |ch, next_ch| {
                             ch.is_ascii_hexdigit() || is_number_separator(ch, next_ch)
-                        });
-                        return Ok(Some(Token::HexStringLiteral(s2)));
+                        })?;
+                        return Ok(Some(Token::HexStringLiteral(s2.keep())));
                     }
 
                     // match one period
                     if let Some('.') = chars.peek() {
-                        s.push('.');
+                        s.push_char('.')?;
                         chars.next();
                     }
 
@@ -1392,32 +1730,32 @@ impl<'a> Tokenizer<'a> {
                     // If so, what follows is definitely not part of a decimal number and
                     // we should yield the dot as a dedicated token so compound identifiers
                     // starting with digits can be parsed correctly.
-                    if s == "." && self.dialect.supports_numeric_prefix() {
+                    if s.as_str() == "." && self.dialect.supports_numeric_prefix() {
                         if let Some(Token::Word(_)) = prev_token {
                             return Ok(Some(Token::Period));
                         }
                     }
 
                     // Consume fractional digits.
-                    s += &peeking_next_take_while(chars, |ch, next_ch| {
+                    next_take_while_into(&mut s, chars, |ch, next_ch| {
                         ch.is_ascii_digit() || is_number_separator(ch, next_ch)
-                    });
+                    })?;
 
                     // No fraction -> Token::Period
-                    if s == "." {
+                    if s.as_str() == "." {
                         return Ok(Some(Token::Period));
                     }
 
                     // Parse exponent as number
-                    let mut exponent_part = String::new();
+                    let mut exponent_part = funding.text();
                     if chars.peek() == Some(&'e') || chars.peek() == Some(&'E') {
                         let mut char_clone = chars.peekable.clone();
-                        exponent_part.push(char_clone.next().unwrap());
+                        exponent_part.push_char(char_clone.next().unwrap())?;
 
                         // Optional sign
                         match char_clone.peek() {
                             Some(&c) if matches!(c, '+' | '-') => {
-                                exponent_part.push(c);
+                                exponent_part.push_char(c)?;
                                 char_clone.next();
                             }
                             _ => (),
@@ -1429,9 +1767,10 @@ impl<'a> Tokenizer<'a> {
                                 for _ in 0..exponent_part.len() {
                                     chars.next();
                                 }
-                                exponent_part +=
-                                    &peeking_take_while(chars, |ch| ch.is_ascii_digit());
-                                s += exponent_part.as_str();
+                                take_while_into(&mut exponent_part, chars, |ch| {
+                                    ch.is_ascii_digit()
+                                })?;
+                                s.push_str(&exponent_part)?;
                             }
                             // Not an exponent, discard the work done
                             _ => (),
@@ -1445,17 +1784,18 @@ impl<'a> Tokenizer<'a> {
                         if exponent_part.is_empty() {
                             // If it is not a number with an exponent, it may be
                             // an identifier starting with digits.
-                            let word =
-                                peeking_take_while(chars, |ch| self.dialect.is_identifier_part(ch));
+                            let number = s.len();
+                            take_while_into(&mut s, chars, |ch| {
+                                self.dialect.is_identifier_part(ch)
+                            })?;
 
-                            if !word.is_empty() {
-                                s += word.as_str();
-                                return Ok(Some(Token::make_word_owned(s, None)));
+                            if s.len() > number {
+                                return Ok(Some(Token::make_word_owned(s.keep(), None)));
                             }
                         } else if prev_token == Some(&Token::Period) {
                             // If the previous token was a period, thus not belonging to a number,
                             // the value we have is part of an identifier.
-                            return Ok(Some(Token::make_word_owned(s, None)));
+                            return Ok(Some(Token::make_word_owned(s.keep(), None)));
                         }
                     }
 
@@ -1465,7 +1805,7 @@ impl<'a> Tokenizer<'a> {
                     } else {
                         false
                     };
-                    Ok(Some(Token::Number(s, long)))
+                    Ok(Some(Token::Number(s.keep(), long)))
                 }
                 // punctuation
                 '(' => self.consume_and_return(chars, Token::LParen),
@@ -1488,13 +1828,7 @@ impl<'a> Tokenizer<'a> {
 
                             if is_comment {
                                 chars.next(); // consume second '-'
-                                let comment = self.tokenize_single_line_comment(chars);
-                                return Ok(Some(Token::Whitespace(
-                                    Whitespace::SingleLineComment {
-                                        prefix: "--".to_owned(),
-                                        comment,
-                                    },
-                                )));
+                                return self.single_line_comment(chars, "--");
                             }
 
                             self.start_binop(chars, "-", Token::Minus)
@@ -1519,11 +1853,7 @@ impl<'a> Tokenizer<'a> {
                         }
                         Some('/') if dialect_of!(self is SnowflakeDialect) => {
                             chars.next(); // consume the second '/', starting a snowflake single-line comment
-                            let comment = self.tokenize_single_line_comment(chars);
-                            Ok(Some(Token::Whitespace(Whitespace::SingleLineComment {
-                                prefix: "//".to_owned(),
-                                comment,
-                            })))
+                            self.single_line_comment(chars, "//")
                         }
                         Some('/') if dialect_of!(self is DuckDbDialect | GenericDialect) => {
                             self.consume_and_return(chars, Token::DuckIntDiv)
@@ -1729,11 +2059,7 @@ impl<'a> Tokenizer<'a> {
                 '#' if dialect_of!(self is SnowflakeDialect | BigQueryDialect | MySqlDialect | HiveDialect) =>
                 {
                     chars.next(); // consume the '#', starting a snowflake single-line comment
-                    let comment = self.tokenize_single_line_comment(chars);
-                    Ok(Some(Token::Whitespace(Whitespace::SingleLineComment {
-                        prefix: "#".to_owned(),
-                        comment,
-                    })))
+                    self.single_line_comment(chars, "#")
                 }
                 '~' => {
                     chars.next(); // consume
@@ -1851,8 +2177,9 @@ impl<'a> Tokenizer<'a> {
                 }
                 '?' => {
                     chars.next();
-                    let s = peeking_take_while(chars, |ch| ch.is_numeric());
-                    Ok(Some(Token::Placeholder(format!("?{s}"))))
+                    let mut s = self.funding().chars(['?'])?;
+                    take_while_into(&mut s, chars, |ch| ch.is_numeric())?;
+                    Ok(Some(Token::Placeholder(s.keep())))
                 }
 
                 // identifier or keyword
@@ -1899,29 +2226,37 @@ impl<'a> Tokenizer<'a> {
         prefix: &str,
         default: Option<Token>,
     ) -> Result<Option<Token>, TokenizerError> {
-        let mut custom = None;
+        let mut custom: Option<Held<'a, String>> = None;
         while let Some(&ch) = chars.peek() {
             if !self.dialect.is_custom_operator_part(ch) {
                 break;
             }
 
-            custom.get_or_insert_with(|| prefix.to_string()).push(ch);
+            match &mut custom {
+                Some(custom) => custom.push_char(ch)?,
+                None => {
+                    let mut started = self.funding().string(prefix)?;
+                    started.push_char(ch)?;
+                    custom = Some(started);
+                }
+            }
             chars.next();
         }
         match (custom, default) {
-            (Some(custom), _) => Ok(Token::CustomBinaryOperator(custom).into()),
+            (Some(custom), _) => Ok(Token::CustomBinaryOperator(custom.keep()).into()),
             (None, Some(tok)) => Ok(Some(tok)),
             (None, None) => self.tokenizer_error(
                 chars.location(),
-                format!("Expected a valid binary operator after '{prefix}'"),
+                format_args!("Expected a valid binary operator after '{prefix}'"),
             ),
         }
     }
 
     /// Tokenize dollar preceded value (i.e: a string/placeholder)
     fn tokenize_dollar_preceded_value(&self, chars: &mut State) -> Result<Token, TokenizerError> {
-        let mut s = String::new();
-        let mut value = String::new();
+        let funding = self.funding();
+        let mut s = funding.text();
+        let mut value = funding.text();
 
         chars.next();
 
@@ -1939,11 +2274,11 @@ impl<'a> Tokenizer<'a> {
                         is_terminated = true;
                         break;
                     } else {
-                        s.push('$');
-                        s.push(ch);
+                        s.push_char('$')?;
+                        s.push_char(ch)?;
                     }
                 } else if ch != '$' {
-                    s.push(ch);
+                    s.push_char(ch)?;
                 }
 
                 prev = Some(ch);
@@ -1951,20 +2286,23 @@ impl<'a> Tokenizer<'a> {
             }
 
             return if chars.peek().is_none() && !is_terminated {
-                self.tokenizer_error(chars.location(), "Unterminated dollar-quoted string")
+                self.tokenizer_error(
+                    chars.location(),
+                    format_args!("Unterminated dollar-quoted string"),
+                )
             } else {
                 Ok(Token::DollarQuotedString(DollarQuotedString {
-                    value: s,
+                    value: s.keep(),
                     tag: None,
                 }))
             };
         } else {
-            value.push_str(&peeking_take_while(chars, |ch| {
+            take_while_into(&mut value, chars, |ch| {
                 ch.is_alphanumeric()
                     || ch == '_'
                     // Allow $ as a placeholder character if the dialect supports it
                     || matches!(ch, '$' if self.dialect.supports_dollar_placeholder())
-            }));
+            })?;
 
             // If the dialect supports a dollar sign as a money prefix (e.g. SQL Server),
             // and the value so far is all digits, check for a decimal part, e.g. `$123.45`
@@ -1973,91 +2311,113 @@ impl<'a> Tokenizer<'a> {
                 && !value.is_empty()
                 && value.chars().all(|c| c.is_ascii_digit())
             {
-                value.push('.');
+                value.push_char('.')?;
                 chars.next();
-                value.push_str(&peeking_take_while(chars, |ch| ch.is_ascii_digit()));
-                return Ok(Token::Placeholder(format!("${value}")));
+                take_while_into(&mut value, chars, |ch| ch.is_ascii_digit())?;
+                let placeholder = funding.format(format_args!("${}", value.as_str()))?;
+                return Ok(Token::Placeholder(placeholder.keep()));
             }
 
             // If the dialect does not support dollar-quoted strings, don't look for the end delimiter.
             if matches!(chars.peek(), Some('$')) && !self.dialect.supports_dollar_placeholder() {
                 chars.next();
 
-                let mut temp = String::new();
-                let end_delimiter = format!("${value}$");
+                let mut temp = funding.text();
+                let end_delimiter = funding.format(format_args!("${}$", value.as_str()))?;
 
                 loop {
                     match chars.next() {
                         Some(ch) => {
-                            temp.push(ch);
+                            temp.push_char(ch)?;
 
-                            if temp.ends_with(&end_delimiter) {
-                                if let Some(temp) = temp.strip_suffix(&end_delimiter) {
-                                    s.push_str(temp);
+                            if temp.ends_with(end_delimiter.as_str()) {
+                                if let Some(temp) = temp.strip_suffix(end_delimiter.as_str()) {
+                                    s.push_str(temp)?;
                                 }
                                 break;
                             }
                         }
                         None => {
-                            if temp.ends_with(&end_delimiter) {
-                                if let Some(temp) = temp.strip_suffix(&end_delimiter) {
-                                    s.push_str(temp);
+                            if temp.ends_with(end_delimiter.as_str()) {
+                                if let Some(temp) = temp.strip_suffix(end_delimiter.as_str()) {
+                                    s.push_str(temp)?;
                                 }
                                 break;
                             }
 
                             return self.tokenizer_error(
                                 chars.location(),
-                                "Unterminated dollar-quoted, expected $",
+                                format_args!("Unterminated dollar-quoted, expected $"),
                             );
                         }
                     }
                 }
             } else {
-                return Ok(Token::Placeholder(format!("${value}")));
+                let placeholder = funding.format(format_args!("${}", value.as_str()))?;
+                return Ok(Token::Placeholder(placeholder.keep()));
             }
         }
 
         Ok(Token::DollarQuotedString(DollarQuotedString {
-            value: s,
-            tag: if value.is_empty() { None } else { Some(value) },
+            value: s.keep(),
+            tag: if value.is_empty() {
+                None
+            } else {
+                Some(value.keep())
+            },
         }))
     }
 
     fn tokenizer_error<R>(
         &self,
         loc: Location,
-        message: impl Into<String>,
+        message: fmt::Arguments<'_>,
     ) -> Result<R, TokenizerError> {
-        Err(TokenizerError {
-            message: message.into(),
-            location: loc,
-        })
+        Err(self.funding().error(loc, message))
+    }
+
+    /// The single-line comment introduced by `prefix`, already consumed.
+    fn single_line_comment(
+        &self,
+        chars: &mut State,
+        prefix: &str,
+    ) -> Result<Option<Token>, TokenizerError> {
+        let comment = self.tokenize_single_line_comment(chars)?;
+        let prefix = self.funding().string(prefix)?;
+        Ok(Some(Token::Whitespace(Whitespace::SingleLineComment {
+            prefix: prefix.keep(),
+            comment: comment.keep(),
+        })))
     }
 
     // Consume characters until newline
-    fn tokenize_single_line_comment(&self, chars: &mut State) -> String {
-        let mut comment = peeking_take_while(chars, |ch| match ch {
+    fn tokenize_single_line_comment(
+        &self,
+        chars: &mut State,
+    ) -> Result<Held<'a, String>, TokenizerError> {
+        let mut comment = peeking_take_while(self.funding(), chars, |ch| match ch {
             '\n' => false,                                           // Always stop at \n
             '\r' if dialect_of!(self is PostgreSqlDialect) => false, // Stop at \r for Postgres
             _ => true, // Keep consuming for other characters
-        });
+        })?;
 
         if let Some(ch) = chars.next() {
             assert!(ch == '\n' || ch == '\r');
-            comment.push(ch);
+            comment.push_char(ch)?;
         }
 
-        comment
+        Ok(comment)
     }
 
     /// Tokenize an identifier or keyword, after the first char is already consumed.
-    fn tokenize_word(&self, first_chars: impl Into<String>, chars: &mut State) -> String {
-        let mut s = first_chars.into();
-        s.push_str(&peeking_take_while(chars, |ch| {
-            self.dialect.is_identifier_part(ch)
-        }));
-        s
+    fn tokenize_word(
+        &self,
+        first_chars: impl IntoIterator<Item = char>,
+        chars: &mut State,
+    ) -> Result<Held<'a, String>, TokenizerError> {
+        let mut s = self.funding().chars(first_chars)?;
+        take_while_into(&mut s, chars, |ch| self.dialect.is_identifier_part(ch))?;
+        Ok(s)
     }
 
     /// Read a quoted identifier
@@ -2065,18 +2425,18 @@ impl<'a> Tokenizer<'a> {
         &self,
         quote_start: char,
         chars: &mut State,
-    ) -> Result<String, TokenizerError> {
+    ) -> Result<Held<'a, String>, TokenizerError> {
         let error_loc = chars.location();
         chars.next(); // consume the opening quote
         let quote_end = Word::matching_end_quote(quote_start);
-        let (s, last_char) = self.parse_quoted_ident(chars, quote_end);
+        let (s, last_char) = self.parse_quoted_ident(chars, quote_end)?;
 
         if last_char == Some(quote_end) {
             Ok(s)
         } else {
             self.tokenizer_error(
                 error_loc,
-                format!("Expected close delimiter '{quote_end}' before EOF."),
+                format_args!("Expected close delimiter '{quote_end}' before EOF."),
             )
         }
     }
@@ -2087,11 +2447,14 @@ impl<'a> Tokenizer<'a> {
         starting_loc: Location,
         chars: &mut State,
     ) -> Result<String, TokenizerError> {
-        if let Some(s) = unescape_single_quoted_string(chars) {
+        if let Some(s) = unescape_single_quoted_string(self.funding(), chars)? {
             return Ok(s);
         }
 
-        self.tokenizer_error(starting_loc, "Unterminated encoded string literal")
+        self.tokenizer_error(
+            starting_loc,
+            format_args!("Unterminated encoded string literal"),
+        )
     }
 
     /// Reads a string literal quoted by a single or triple quote characters.
@@ -2123,11 +2486,14 @@ impl<'a> Tokenizer<'a> {
             1 => (single_quote_token, NumStringQuoteChars::One),
             2 => {
                 // If we matched double quotes, then this is an empty string.
-                return Ok(Some(single_quote_token("".into())));
+                return Ok(Some(single_quote_token(String::new())));
             }
             3 => {
                 let Some(num_quote_chars) = NonZeroU8::new(3) else {
-                    return self.tokenizer_error(error_loc, "invalid number of opening quotes");
+                    return self.tokenizer_error(
+                        error_loc,
+                        format_args!("invalid number of opening quotes"),
+                    );
                 };
                 (
                     triple_quote_token,
@@ -2135,7 +2501,8 @@ impl<'a> Tokenizer<'a> {
                 )
             }
             _ => {
-                return self.tokenizer_error(error_loc, "invalid string literal opening");
+                return self
+                    .tokenizer_error(error_loc, format_args!("invalid string literal opening"));
             }
         };
 
@@ -2187,9 +2554,9 @@ impl<'a> Tokenizer<'a> {
             None | Some(' ') | Some('\t') | Some('\r') | Some('\n') => {
                 return self.tokenizer_error(
                     start_quote_loc,
-                    format!(
+                    format_args!(
                         "Invalid space, tab, newline, or EOF after '{}''",
-                        String::from_iter(literal_prefix)
+                        CharsDisplay(literal_prefix)
                     ),
                 );
             }
@@ -2206,22 +2573,25 @@ impl<'a> Tokenizer<'a> {
         };
 
         // read the string literal until the "quote character" following a by literal quote
-        let mut value = String::new();
+        let mut value = self.funding().text();
         while let Some(ch) = chars.next() {
             if ch == end_quote {
                 if let Some('\'') = chars.peek() {
                     chars.next(); // ~ consume the quote
                     return Ok(QuoteDelimitedString {
                         start_quote,
-                        value,
+                        value: value.keep(),
                         end_quote,
                     });
                 }
             }
-            value.push(ch);
+            value.push_char(ch)?;
         }
 
-        self.tokenizer_error(literal_start_loc, "Unterminated string literal")
+        self.tokenizer_error(
+            literal_start_loc,
+            format_args!("Unterminated string literal"),
+        )
     }
 
     /// Read a quoted string.
@@ -2230,13 +2600,14 @@ impl<'a> Tokenizer<'a> {
         chars: &mut State,
         settings: TokenizeQuotedStringSettings,
     ) -> Result<String, TokenizerError> {
-        let mut s = String::new();
+        let mut s = self.funding().text();
         let error_loc = chars.location();
 
         // Consume any opening quotes.
         for _ in 0..settings.num_opening_quotes_to_consume {
             if Some(settings.quote_style) != chars.next() {
-                return self.tokenizer_error(error_loc, "invalid string literal opening");
+                return self
+                    .tokenizer_error(error_loc, format_args!("invalid string literal opening"));
             }
         }
 
@@ -2265,20 +2636,22 @@ impl<'a> Tokenizer<'a> {
                         for _ in 1..count.get() {
                             buf.next_back();
                         }
-                        return Ok(buf.as_str().to_string());
+                        let len = buf.as_str().len();
+                        s.truncate(len);
+                        return Ok(s.keep());
                     } else if chars
                         .peek()
                         .map(|c| *c == settings.quote_style)
                         .unwrap_or(false)
                     {
-                        s.push(ch);
+                        s.push_char(ch)?;
                         if !self.unescape {
                             // In no-escape mode, the given query has to be saved completely
-                            s.push(ch);
+                            s.push_char(ch)?;
                         }
                         chars.next();
                     } else {
-                        return Ok(s);
+                        return Ok(s.keep());
                     }
                 }
                 '\\' if settings.backslash_escape => {
@@ -2287,16 +2660,16 @@ impl<'a> Tokenizer<'a> {
 
                     num_consecutive_quotes = 0;
 
-                    if let Some(next) = chars.peek() {
+                    if let Some(&next) = chars.peek() {
                         if !self.unescape
                             || (self.dialect.ignores_wildcard_escapes()
-                                && (*next == '%' || *next == '_'))
+                                && (next == '%' || next == '_'))
                         {
                             // In no-escape mode, the given query has to be saved completely
                             // including backslashes. Similarly, with ignore_like_wildcard_escapes,
                             // the backslash is not stripped.
-                            s.push(ch);
-                            s.push(*next);
+                            s.push_char(ch)?;
+                            s.push_char(next)?;
                             chars.next(); // consume next
                         } else {
                             let n = match next {
@@ -2308,9 +2681,9 @@ impl<'a> Tokenizer<'a> {
                                 'r' => '\r',
                                 't' => '\t',
                                 'Z' => '\u{1a}',
-                                _ => *next,
+                                _ => next,
                             };
-                            s.push(n);
+                            s.push_char(n)?;
                             chars.next(); // consume next
                         }
                     }
@@ -2324,71 +2697,75 @@ impl<'a> Tokenizer<'a> {
                         num_consecutive_quotes = 0;
                     }
 
-                    s.push(ch);
+                    s.push_char(ch)?;
                 }
             }
         }
-        self.tokenizer_error(error_loc, "Unterminated string literal")
+        self.tokenizer_error(error_loc, format_args!("Unterminated string literal"))
     }
 
     fn tokenize_multiline_comment(
         &self,
         chars: &mut State,
     ) -> Result<Option<Token>, TokenizerError> {
-        let mut s = String::new();
+        let mut s = self.funding().text();
         let mut nested = 1;
         let supports_nested_comments = self.dialect.supports_nested_comments();
         loop {
             match chars.next() {
                 Some('/') if matches!(chars.peek(), Some('*')) && supports_nested_comments => {
                     chars.next(); // consume the '*'
-                    s.push('/');
-                    s.push('*');
+                    s.push_str("/*")?;
                     nested += 1;
                 }
                 Some('*') if matches!(chars.peek(), Some('/')) => {
                     chars.next(); // consume the '/'
                     nested -= 1;
                     if nested == 0 {
-                        break Ok(Some(Token::Whitespace(Whitespace::MultiLineComment(s))));
+                        break Ok(Some(Token::Whitespace(Whitespace::MultiLineComment(
+                            s.keep(),
+                        ))));
                     }
-                    s.push('*');
-                    s.push('/');
+                    s.push_str("*/")?;
                 }
                 Some(ch) => {
-                    s.push(ch);
+                    s.push_char(ch)?;
                 }
                 None => {
                     break self.tokenizer_error(
                         chars.location(),
-                        "Unexpected EOF while in a multi-line comment",
+                        format_args!("Unexpected EOF while in a multi-line comment"),
                     );
                 }
             }
         }
     }
 
-    fn parse_quoted_ident(&self, chars: &mut State, quote_end: char) -> (String, Option<char>) {
+    fn parse_quoted_ident(
+        &self,
+        chars: &mut State,
+        quote_end: char,
+    ) -> Result<(Held<'a, String>, Option<char>), TokenizerError> {
         let mut last_char = None;
-        let mut s = String::new();
+        let mut s = self.funding().text();
         while let Some(ch) = chars.next() {
             if ch == quote_end {
                 if chars.peek() == Some(&quote_end) {
                     chars.next();
-                    s.push(ch);
+                    s.push_char(ch)?;
                     if !self.unescape {
                         // In no-escape mode, the given query has to be saved completely
-                        s.push(ch);
+                        s.push_char(ch)?;
                     }
                 } else {
                     last_char = Some(quote_end);
                     break;
                 }
             } else {
-                s.push(ch);
+                s.push_char(ch)?;
             }
         }
-        (s, last_char)
+        Ok((s, last_char))
     }
 
     #[allow(clippy::unnecessary_wraps)]
@@ -2402,42 +2779,92 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// The characters of a literal's prefix, written out where they are read.
+struct CharsDisplay<'c>(&'c [char]);
+
+impl fmt::Display for CharsDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0
+            .iter()
+            .try_for_each(|ch| fmt::Write::write_char(f, *ch))
+    }
+}
+
 /// Read from `chars` until `predicate` returns `false` or EOF is hit.
 /// Return the characters read as String, and keep the first non-matching
 /// char available as `chars.next()`.
-fn peeking_take_while(chars: &mut State, mut predicate: impl FnMut(char) -> bool) -> String {
-    let mut s = String::new();
+fn peeking_take_while<'f>(
+    funding: Funding<'f>,
+    chars: &mut State,
+    predicate: impl FnMut(char) -> bool,
+) -> Result<Held<'f, String>, TokenizerError> {
+    let mut s = funding.text();
+    take_while_into(&mut s, chars, predicate)?;
+    Ok(s)
+}
+
+/// Same as [`peeking_take_while`], appending what it reads to `s`.
+fn take_while_into(
+    s: &mut Held<'_, String>,
+    chars: &mut State,
+    mut predicate: impl FnMut(char) -> bool,
+) -> Result<(), TokenizerError> {
+    while let Some(&ch) = chars.peek() {
+        if predicate(ch) {
+            s.push_char(ch)?;
+            chars.next(); // consume
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Same as [`peeking_take_while`], keeping nothing it reads.
+fn skip_while(chars: &mut State, mut predicate: impl FnMut(char) -> bool) {
     while let Some(&ch) = chars.peek() {
         if predicate(ch) {
             chars.next(); // consume
-            s.push(ch);
         } else {
             break;
         }
     }
-    s
 }
 
 /// Same as peeking_take_while, but also passes the next character to the predicate.
-fn peeking_next_take_while(
+fn peeking_next_take_while<'f>(
+    funding: Funding<'f>,
+    chars: &mut State,
+    predicate: impl FnMut(char, Option<char>) -> bool,
+) -> Result<Held<'f, String>, TokenizerError> {
+    let mut s = funding.text();
+    next_take_while_into(&mut s, chars, predicate)?;
+    Ok(s)
+}
+
+/// Same as [`peeking_next_take_while`], appending what it reads to `s`.
+fn next_take_while_into(
+    s: &mut Held<'_, String>,
     chars: &mut State,
     mut predicate: impl FnMut(char, Option<char>) -> bool,
-) -> String {
-    let mut s = String::new();
+) -> Result<(), TokenizerError> {
     while let Some(&ch) = chars.peek() {
         let next_char = chars.peekable.clone().nth(1);
         if predicate(ch, next_char) {
+            s.push_char(ch)?;
             chars.next(); // consume
-            s.push(ch);
         } else {
             break;
         }
     }
-    s
+    Ok(())
 }
 
-fn unescape_single_quoted_string(chars: &mut State<'_>) -> Option<String> {
-    Unescape::new(chars).unescape()
+fn unescape_single_quoted_string(
+    funding: Funding<'_>,
+    chars: &mut State<'_>,
+) -> Result<Option<String>, TokenizerError> {
+    Unescape::new(chars).unescape(funding)
 }
 
 struct Unescape<'a: 'b, 'b> {
@@ -2448,8 +2875,10 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     fn new(chars: &'b mut State<'a>) -> Self {
         Self { chars }
     }
-    fn unescape(mut self) -> Option<String> {
-        let mut unescaped = String::new();
+
+    /// The string unescaped, `None` if it is not a valid one.
+    fn unescape(mut self, funding: Funding<'_>) -> Result<Option<String>, TokenizerError> {
+        let mut unescaped = funding.text();
 
         self.chars.next();
 
@@ -2458,34 +2887,41 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
                 // case: ''''
                 if self.chars.peek().map(|c| *c == '\'').unwrap_or(false) {
                     self.chars.next();
-                    unescaped.push('\'');
+                    unescaped.push_char('\'')?;
                     continue;
                 }
-                return Some(unescaped);
+                return Ok(Some(unescaped.keep()));
             }
 
             if c != '\\' {
-                unescaped.push(c);
+                unescaped.push_char(c)?;
                 continue;
             }
 
-            let c = match self.chars.next()? {
-                'b' => '\u{0008}',
-                'f' => '\u{000C}',
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                'u' => self.unescape_unicode_16()?,
-                'U' => self.unescape_unicode_32()?,
-                'x' => self.unescape_hex()?,
-                c if c.is_digit(8) => self.unescape_octal(c)?,
-                c => c,
+            let Some(c) = self.escaped() else {
+                return Ok(None);
             };
-
-            unescaped.push(Self::check_null(c)?);
+            unescaped.push_char(c)?;
         }
 
-        None
+        Ok(None)
+    }
+
+    /// The character escaped after a backslash, `None` if it is not a valid one.
+    fn escaped(&mut self) -> Option<char> {
+        let c = match self.chars.next()? {
+            'b' => '\u{0008}',
+            'f' => '\u{000C}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'u' => self.unescape_unicode_16()?,
+            'U' => self.unescape_unicode_32()?,
+            'x' => self.unescape_hex()?,
+            c if c.is_digit(8) => self.unescape_octal(c)?,
+            c => c,
+        };
+        Self::check_null(c)
     }
 
     #[inline]
@@ -2515,7 +2951,7 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
 
     // Hexadecimal byte value. \xh, \xhh (h = 0–9, A–F)
     fn unescape_hex(&mut self) -> Option<char> {
-        let mut s = String::new();
+        let mut s = Digits::new();
 
         for _ in 0..2 {
             match self.next_hex_digit() {
@@ -2528,7 +2964,7 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
             return Some('x');
         }
 
-        Self::byte_to_char::<16>(&s)
+        Self::byte_to_char::<16>(s.as_str())
     }
 
     #[inline]
@@ -2541,7 +2977,7 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
 
     // Octal byte value. \o, \oo, \ooo (o = 0–7)
     fn unescape_octal(&mut self, c: char) -> Option<char> {
-        let mut s = String::new();
+        let mut s = Digits::new();
 
         s.push(c);
         for _ in 0..2 {
@@ -2551,7 +2987,7 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
             }
         }
 
-        Self::byte_to_char::<8>(&s)
+        Self::byte_to_char::<8>(s.as_str())
     }
 
     #[inline]
@@ -2573,72 +3009,81 @@ impl<'a: 'b, 'b> Unescape<'a, 'b> {
     }
 
     fn unescape_unicode<const NUM: usize>(&mut self) -> Option<char> {
-        let mut s = String::new();
+        let mut s = Digits::new();
         for _ in 0..NUM {
             s.push(self.chars.next()?);
         }
-        match u32::from_str_radix(&s, 16) {
+        match u32::from_str_radix(s.as_str(), 16) {
             Err(_) => None,
             Ok(n) => char::from_u32(n),
         }
     }
 }
 
-fn unescape_unicode_single_quoted_string(chars: &mut State<'_>) -> Result<String, TokenizerError> {
-    let mut unescaped = String::new();
+fn unescape_unicode_single_quoted_string(
+    funding: Funding<'_>,
+    chars: &mut State<'_>,
+) -> Result<String, TokenizerError> {
+    let mut unescaped = funding.text();
     chars.next(); // consume the opening quote
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
                 if chars.peek() == Some(&'\'') {
                     chars.next();
-                    unescaped.push('\'');
+                    unescaped.push_char('\'')?;
                 } else {
-                    return Ok(unescaped);
+                    return Ok(unescaped.keep());
                 }
             }
             '\\' => match chars.peek() {
                 Some('\\') => {
                     chars.next();
-                    unescaped.push('\\');
+                    unescaped.push_char('\\')?;
                 }
                 Some('+') => {
                     chars.next();
-                    unescaped.push(take_char_from_hex_digits(chars, 6)?);
+                    unescaped.push_char(take_char_from_hex_digits(funding, chars, 6)?)?;
                 }
-                _ => unescaped.push(take_char_from_hex_digits(chars, 4)?),
+                _ => unescaped.push_char(take_char_from_hex_digits(funding, chars, 4)?)?,
             },
             _ => {
-                unescaped.push(c);
+                unescaped.push_char(c)?;
             }
         }
     }
-    Err(TokenizerError {
-        message: "Unterminated unicode encoded string literal".to_string(),
-        location: chars.location(),
-    })
+    Err(funding.error(
+        chars.location(),
+        format_args!("Unterminated unicode encoded string literal"),
+    ))
 }
 
 fn take_char_from_hex_digits(
+    funding: Funding<'_>,
     chars: &mut State<'_>,
     max_digits: usize,
 ) -> Result<char, TokenizerError> {
     let mut result = 0u32;
     for _ in 0..max_digits {
-        let next_char = chars.next().ok_or_else(|| TokenizerError {
-            message: "Unexpected EOF while parsing hex digit in escaped unicode string."
-                .to_string(),
-            location: chars.location(),
+        let next_char = chars.next().ok_or_else(|| {
+            funding.error(
+                chars.location(),
+                format_args!("Unexpected EOF while parsing hex digit in escaped unicode string."),
+            )
         })?;
-        let digit = next_char.to_digit(16).ok_or_else(|| TokenizerError {
-            message: format!("Invalid hex digit in escaped unicode string: {next_char}"),
-            location: chars.location(),
+        let digit = next_char.to_digit(16).ok_or_else(|| {
+            funding.error(
+                chars.location(),
+                format_args!("Invalid hex digit in escaped unicode string: {next_char}"),
+            )
         })?;
         result = result * 16 + digit;
     }
-    char::from_u32(result).ok_or_else(|| TokenizerError {
-        message: format!("Invalid unicode character: {result:x}"),
-        location: chars.location(),
+    char::from_u32(result).ok_or_else(|| {
+        funding.error(
+            chars.location(),
+            format_args!("Invalid unicode character: {result:x}"),
+        )
     })
 }
 
@@ -2657,6 +3102,7 @@ mod tests {
         let err = TokenizerError {
             message: "test".into(),
             location: Location { line: 1, column: 1 },
+            kind: TokenizerErrorKind::Syntax,
         };
         {
             use core::error::Error;
@@ -3070,6 +3516,7 @@ mod tests {
             Err(TokenizerError {
                 message: "Unterminated string literal".to_string(),
                 location: Location { line: 1, column: 8 },
+                kind: TokenizerErrorKind::Syntax,
             })
         );
     }
@@ -3087,7 +3534,8 @@ mod tests {
                 location: Location {
                     line: 1,
                     column: 35
-                }
+                },
+                kind: TokenizerErrorKind::Syntax,
             })
         );
     }
@@ -3192,7 +3640,8 @@ mod tests {
                 location: Location {
                     line: 1,
                     column: 91
-                }
+                },
+                kind: TokenizerErrorKind::Syntax,
             })
         );
     }
@@ -3208,7 +3657,8 @@ mod tests {
                 location: Location {
                     line: 1,
                     column: 17
-                }
+                },
+                kind: TokenizerErrorKind::Syntax,
             })
         );
     }
@@ -3299,7 +3749,8 @@ mod tests {
                 location: Location {
                     line: 1,
                     column: 86
-                }
+                },
+                kind: TokenizerErrorKind::Syntax,
             })
         );
     }
@@ -3544,6 +3995,7 @@ mod tests {
             Err(TokenizerError {
                 message: "Expected close delimiter '\"' before EOF.".to_string(),
                 location: Location { line: 1, column: 1 },
+                kind: TokenizerErrorKind::Syntax,
             })
         );
     }
@@ -3762,8 +4214,8 @@ mod tests {
         };
 
         assert_eq!(
-            unescape_single_quoted_string(&mut state),
-            expected.map(|s| s.to_string())
+            unescape_single_quoted_string(Funding(&UNFUNDED), &mut state),
+            Ok(expected.map(|s| s.to_string()))
         );
     }
 
@@ -4525,6 +4977,105 @@ mod tests {
                 Token::Plus,
                 Token::make_word("b", None),
             ],
+        );
+    }
+
+    /// Funding that refuses what would take it past `limit`, counting what it charged.
+    struct Limited {
+        limit: usize,
+        charged: core::cell::Cell<usize>,
+    }
+
+    impl TokenizerFunding for Limited {
+        fn charge(&self, bytes: usize) -> bool {
+            let charged = self.charged.get() + bytes;
+            if charged > self.limit {
+                return false;
+            }
+            self.charged.set(charged);
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            self.charged.set(self.charged.get() - bytes);
+        }
+    }
+
+    /// The bytes the tokens and the buffer they are in hold.
+    fn kept(capacity: usize, tokens: &[TokenWithSpan]) -> usize {
+        capacity * core::mem::size_of::<TokenWithSpan>()
+            + tokens
+                .iter()
+                .map(|token| match &token.token {
+                    Token::Word(word) => word.value.capacity(),
+                    Token::Number(number, _) => number.capacity(),
+                    Token::SingleQuotedString(text) => text.capacity(),
+                    Token::Placeholder(text) => text.capacity(),
+                    Token::Whitespace(Whitespace::SingleLineComment { prefix, comment }) => {
+                        prefix.capacity() + comment.capacity()
+                    }
+                    Token::Whitespace(Whitespace::MultiLineComment(comment)) => comment.capacity(),
+                    _ => 0,
+                })
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn tokenizing_is_charged_before_it_allocates_and_refused_without_allocating() {
+        let dialect = GenericDialect {};
+        let sql = "SELECT 'it''s', 123.5e3, $1 FROM t /* c */ -- c\n";
+        let ample = Limited {
+            limit: usize::MAX,
+            charged: core::cell::Cell::new(0),
+        };
+        let mut tokens = vec![];
+        Tokenizer::new(&dialect, sql)
+            .with_funding(&ample)
+            .tokenize_with_location_into_buf(&mut tokens)
+            .expect("tokenized within ample funding");
+        let needed = ample.charged.get();
+        assert_eq!(
+            needed,
+            kept(tokens.capacity(), &tokens),
+            "what the tokens keep is charged, and only that"
+        );
+
+        for limit in 0..needed {
+            let funding = Limited {
+                limit,
+                charged: core::cell::Cell::new(0),
+            };
+            let mut tokens = vec![];
+            let refused = Tokenizer::new(&dialect, sql)
+                .with_funding(&funding)
+                .tokenize_with_location_into_buf(&mut tokens)
+                .expect_err("refused within less than it needs");
+            assert!(refused.is_out_of_memory(), "{refused:?}");
+            assert_eq!(refused.message, "");
+            assert_eq!(
+                funding.charged.get(),
+                kept(tokens.capacity(), &tokens),
+                "within {limit} bytes, what was made and freed was given back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_syntax_errors_message_is_charged() {
+        let dialect = GenericDialect {};
+        let funding = Limited {
+            limit: usize::MAX,
+            charged: core::cell::Cell::new(0),
+        };
+        let mut tokens = vec![];
+        let error = Tokenizer::new(&dialect, "SELECT 'open")
+            .with_funding(&funding)
+            .tokenize_with_location_into_buf(&mut tokens)
+            .expect_err("an unterminated string");
+        assert_eq!(error.kind, TokenizerErrorKind::Syntax);
+        assert_eq!(
+            funding.charged.get(),
+            kept(tokens.capacity(), &tokens) + error.message.capacity()
         );
     }
 }
