@@ -1483,11 +1483,12 @@ impl<'a> Parser<'a> {
     /// Parse `UNLISTEN` statement.
     pub fn parse_unlisten(&mut self) -> Result<Statement, ParserError> {
         let channel = if self.consume_token(&Token::Mul) {
-            Ident::new(Expr::Wildcard(AttachedToken::empty()).to_string())
+            Ident::new(self.string("*")?)
         } else {
             match self.parse_identifier() {
                 Ok(expr) => expr,
-                _ => {
+                Err(error) => {
+                    self.discarded(error);
                     self.prev_token();
                     return self.expected_ref("wildcard or identifier", self.peek_token_ref());
                 }
@@ -1547,7 +1548,7 @@ impl<'a> Parser<'a> {
             if dialect_of!(self is PostgreSqlDialect | GenericDialect) =>
                 {
                     Ok(Some(Expr::Function(Function {
-                        name: ObjectName::from(vec![w.to_ident(w_span)]),
+                        name: ObjectName(self.vec_of([ObjectNamePart::Identifier(self.ident(w, w_span)?)])?),
                         uses_odbc_syntax: false,
                         parameters: FunctionArguments::None,
                         args: FunctionArguments::None,
@@ -1562,7 +1563,7 @@ impl<'a> Parser<'a> {
             | Keyword::CURRENT_DATE
             | Keyword::LOCALTIME
             | Keyword::LOCALTIMESTAMP => {
-                Ok(Some(self.parse_time_functions(ObjectName::from(vec![w.to_ident(w_span)]))?))
+                Ok(Some(self.parse_time_functions(ObjectName(self.vec_of([ObjectNamePart::Identifier(self.ident(w, w_span)?)])?))?))
             }
             Keyword::CASE => Ok(Some(self.parse_case_expr()?)),
             Keyword::CONVERT => Ok(Some(self.parse_convert_expr(false)?)),
@@ -1587,7 +1588,7 @@ impl<'a> Parser<'a> {
             Keyword::CEIL => Ok(Some(self.parse_ceil_floor_expr(true)?)),
             Keyword::FLOOR => Ok(Some(self.parse_ceil_floor_expr(false)?)),
             Keyword::POSITION if self.peek_token_ref().token == Token::LParen => {
-                Ok(Some(self.parse_position_expr(w.to_ident(w_span))?))
+                Ok(Some(self.parse_position_expr(self.ident(w, w_span)?)?))
             }
             Keyword::SUBSTR | Keyword::SUBSTRING => {
                 self.prev_token();
@@ -1609,7 +1610,7 @@ impl<'a> Parser<'a> {
                     let query = self.parse_query()?;
                     self.expect_token(&Token::RParen)?;
                     Ok(Some(Expr::Function(Function {
-                        name: ObjectName::from(vec![w.to_ident(w_span)]),
+                        name: ObjectName(self.vec_of([ObjectNamePart::Identifier(self.ident(w, w_span)?)])?),
                         uses_odbc_syntax: false,
                         parameters: FunctionArguments::None,
                         args: FunctionArguments::Subquery(query),
@@ -1629,7 +1630,7 @@ impl<'a> Parser<'a> {
             }
             Keyword::PRIOR if matches!(self.state, ParserState::ConnectBy) => {
                 let expr = self.parse_subexpr(self.dialect.prec_value(Precedence::PlusMinus))?;
-                Ok(Some(Expr::Prior(Box::new(expr))))
+                Ok(Some(Expr::Prior(self.boxed(expr)?)))
             }
             Keyword::MAP if *self.peek_token_ref() == Token::LBrace && self.dialect.support_map_literal_syntax() => {
                 Ok(Some(self.parse_duckdb_map_literal()?))
@@ -2256,6 +2257,7 @@ impl<'a> Parser<'a> {
             let Some(AccessExpr::Dot(Expr::OuterJoin(inner_expr))) = access_chain.pop() else {
                 return parser_err!(self, "expected (+) expression", root.span().start);
             };
+            self.released(access_chain);
 
             if !Self::is_all_ident(&root, &[]) {
                 return parser_err!(self, "column identifier before (+)", root.span().start);
@@ -2401,7 +2403,7 @@ impl<'a> Parser<'a> {
             let expr = p.parse_expr()?;
             Ok(Expr::Lambda(LambdaFunction {
                 params: OneOrManyWithParens::Many(params),
-                body: Box::new(expr),
+                body: p.boxed(expr)?,
                 syntax: LambdaSyntax::Arrow,
             }))
         })
@@ -2425,7 +2427,7 @@ impl<'a> Parser<'a> {
         let body = self.parse_expr()?;
         Ok(Expr::Lambda(LambdaFunction {
             params,
-            body: Box::new(body),
+            body: self.boxed(body)?,
             syntax: LambdaSyntax::LambdaKeyword,
         }))
     }
@@ -2443,10 +2445,12 @@ impl<'a> Parser<'a> {
         } else {
             // Unparenthesized parameters: x or x, y
             let params = self.parse_comma_separated(|p| p.parse_lambda_function_parameter())?;
-            if params.len() == 1 {
-                OneOrManyWithParens::One(params.into_iter().next().unwrap())
-            } else {
+            if params.len() > 1 {
                 OneOrManyWithParens::Many(params)
+            } else if let Some(param) = self.only(params) {
+                OneOrManyWithParens::One(param)
+            } else {
+                return self.expected_ref("a lambda parameter", self.peek_token_ref());
             }
         };
         Ok(params)
@@ -2489,13 +2493,27 @@ impl<'a> Parser<'a> {
     /// https://learn.microsoft.com/en-us/sql/odbc/reference/develop-app/date-time-and-timestamp-literals?view=sql-server-2017
     fn maybe_parse_odbc_body_datetime(&mut self) -> Result<Option<Expr>, ParserError> {
         self.maybe_parse(|p| {
-            let token = p.next_token().clone();
-            let word_string = token.token.to_string();
-            let data_type = match word_string.as_str() {
-                "t" => DataType::Time(None, TimezoneInfo::None),
-                "d" => DataType::Date,
-                "ts" => DataType::Timestamp(None, TimezoneInfo::None),
-                _ => return p.expected("ODBC datetime keyword (t, d, or ts)", token),
+            p.advance_token();
+            let data_type = match &p.get_current_token().token {
+                Token::Word(Word {
+                    value,
+                    quote_style: None,
+                    ..
+                }) if value == "t" => DataType::Time(None, TimezoneInfo::None),
+                Token::Word(Word {
+                    value,
+                    quote_style: None,
+                    ..
+                }) if value == "d" => DataType::Date,
+                Token::Word(Word {
+                    value,
+                    quote_style: None,
+                    ..
+                }) if value == "ts" => DataType::Timestamp(None, TimezoneInfo::None),
+                _ => {
+                    return p
+                        .expected_at("ODBC datetime keyword (t, d, or ts)", p.get_current_index())
+                }
             };
             let value = p.parse_value()?;
             Ok(Expr::TypedString(TypedString {
@@ -2575,7 +2593,8 @@ impl<'a> Parser<'a> {
             && self.consume_token(&Token::LParen)
             && self.parse_keyword(Keyword::WHERE)
         {
-            let filter = Some(Box::new(self.parse_expr()?));
+            let filter = self.parse_expr()?;
+            let filter = Some(self.boxed(filter)?);
             self.expect_token(&Token::RParen)?;
             filter
         } else {
@@ -2654,15 +2673,12 @@ impl<'a> Parser<'a> {
 
     /// Parse window frame `UNITS` clause: `ROWS`, `RANGE`, or `GROUPS`.
     pub fn parse_window_frame_units(&mut self) -> Result<WindowFrameUnits, ParserError> {
-        let next_token = self.next_token();
-        match &next_token.token {
-            Token::Word(w) => match w.keyword {
-                Keyword::ROWS => Ok(WindowFrameUnits::Rows),
-                Keyword::RANGE => Ok(WindowFrameUnits::Range),
-                Keyword::GROUPS => Ok(WindowFrameUnits::Groups),
-                _ => self.expected("ROWS, RANGE, GROUPS", next_token)?,
-            },
-            _ => self.expected("ROWS, RANGE, GROUPS", next_token),
+        self.advance_token();
+        match &self.get_current_token().token {
+            Token::Word(w) if w.keyword == Keyword::ROWS => Ok(WindowFrameUnits::Rows),
+            Token::Word(w) if w.keyword == Keyword::RANGE => Ok(WindowFrameUnits::Range),
+            Token::Word(w) if w.keyword == Keyword::GROUPS => Ok(WindowFrameUnits::Groups),
+            _ => self.expected_at("ROWS, RANGE, GROUPS", self.get_current_index()),
         }
     }
 
@@ -2692,10 +2708,11 @@ impl<'a> Parser<'a> {
             let rows = if self.parse_keyword(Keyword::UNBOUNDED) {
                 None
             } else {
-                Some(Box::new(match &self.peek_token_ref().token {
+                let rows = match &self.peek_token_ref().token {
                     Token::SingleQuotedString(_) => self.parse_interval()?,
                     _ => self.parse_expr()?,
-                }))
+                };
+                Some(self.boxed(rows)?)
             };
             if self.parse_keyword(Keyword::PRECEDING) {
                 Ok(WindowFrameBound::Preceding(rows))
@@ -2758,7 +2775,8 @@ impl<'a> Parser<'a> {
                 };
                 Ok(result)
             } else {
-                Ok(vec![self.parse_expr()?])
+                let expr = self.parse_expr()?;
+                self.vec_of([expr])
             }
         } else {
             self.expect_token(&Token::LParen)?;
@@ -2775,10 +2793,11 @@ impl<'a> Parser<'a> {
 
     /// Parse a `CASE` expression and return an [`Expr::Case`].
     pub fn parse_case_expr(&mut self) -> Result<Expr, ParserError> {
-        let case_token = AttachedToken(self.get_current_token().clone());
+        let case_token = AttachedToken(self.copied(self.get_current_token())?);
         let mut operand = None;
         if !self.parse_keyword(Keyword::WHEN) {
-            operand = Some(Box::new(self.parse_expr()?));
+            let expr = self.parse_expr()?;
+            operand = Some(self.boxed(expr)?);
             self.expect_keyword_is(Keyword::WHEN)?;
         }
         let mut conditions = vec![];
@@ -2786,13 +2805,14 @@ impl<'a> Parser<'a> {
             let condition = self.parse_expr()?;
             self.expect_keyword_is(Keyword::THEN)?;
             let result = self.parse_expr()?;
-            conditions.push(CaseWhen { condition, result });
+            self.push(&mut conditions, CaseWhen { condition, result })?;
             if !self.parse_keyword(Keyword::WHEN) {
                 break;
             }
         }
         let else_result = if self.parse_keyword(Keyword::ELSE) {
-            Some(Box::new(self.parse_expr()?))
+            let expr = self.parse_expr()?;
+            Some(self.boxed(expr)?)
         } else {
             None
         };
@@ -2842,7 +2862,7 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?;
         Ok(Expr::Convert {
             is_try,
-            expr: Box::new(expr),
+            expr: self.boxed(expr)?,
             data_type: Some(data_type),
             charset: None,
             target_before_value: true,
@@ -2865,7 +2885,7 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::RParen)?;
             return Ok(Expr::Convert {
                 is_try,
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 data_type: None,
                 charset: Some(charset),
                 target_before_value: false,
@@ -2882,7 +2902,7 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?;
         Ok(Expr::Convert {
             is_try,
-            expr: Box::new(expr),
+            expr: self.boxed(expr)?,
             data_type: Some(data_type),
             charset,
             target_before_value: false,
@@ -2901,7 +2921,7 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?;
         Ok(Expr::Cast {
             kind,
-            expr: Box::new(expr),
+            expr: self.boxed(expr)?,
             data_type,
             array,
             format,
@@ -2937,7 +2957,7 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?;
         Ok(Expr::Extract {
             field,
-            expr: Box::new(expr),
+            expr: self.boxed(expr)?,
             syntax,
         })
     }
@@ -2964,12 +2984,12 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?;
         if is_ceil {
             Ok(Expr::Ceil {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 field,
             })
         } else {
             Ok(Expr::Floor {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 field,
             })
         }
@@ -2988,15 +3008,22 @@ impl<'a> Parser<'a> {
             let from = p.parse_expr()?;
             p.expect_token(&Token::RParen)?;
             Ok(Expr::Position {
-                expr: Box::new(expr),
-                r#in: Box::new(from),
+                expr: p.boxed(expr)?,
+                r#in: p.boxed(from)?,
             })
         })?;
         match position_expr {
-            Some(expr) => Ok(expr),
+            Some(expr) => {
+                // The name is not needed: freed, its copy is given back.
+                self.released(ident.value);
+                Ok(expr)
+            }
             // Snowflake supports `position` as an ordinary function call
             // without the special `IN` syntax.
-            None => self.parse_function(ObjectName::from(vec![ident])),
+            None => {
+                let name = ObjectName(self.vec_of([ObjectNamePart::Identifier(ident)])?);
+                self.parse_function(name)
+            }
         }
     }
 
@@ -3025,9 +3052,9 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?;
 
         Ok(Expr::Substring {
-            expr: Box::new(expr),
-            substring_from: from_expr.map(Box::new),
-            substring_for: to_expr.map(Box::new),
+            expr: self.boxed(expr)?,
+            substring_from: self.maybe_boxed(from_expr)?,
+            substring_for: self.maybe_boxed(to_expr)?,
             special,
             shorthand,
         })
@@ -3051,10 +3078,10 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?;
 
         Ok(Expr::Overlay {
-            expr: Box::new(expr),
-            overlay_what: Box::new(what_expr),
-            overlay_from: Box::new(from_expr),
-            overlay_for: for_expr.map(Box::new),
+            expr: self.boxed(expr)?,
+            overlay_what: self.boxed(what_expr)?,
+            overlay_from: self.boxed(from_expr)?,
+            overlay_for: self.maybe_boxed(for_expr)?,
         })
     }
 
@@ -3073,11 +3100,11 @@ impl<'a> Parser<'a> {
         }
         let expr = self.parse_expr()?;
         if self.parse_keyword(Keyword::FROM) {
-            let trim_what = Box::new(expr);
+            let trim_what = self.boxed(expr)?;
             let expr = self.parse_expr()?;
             self.expect_token(&Token::RParen)?;
             Ok(Expr::Trim {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 trim_where,
                 trim_what: Some(trim_what),
                 trim_characters: None,
@@ -3087,7 +3114,7 @@ impl<'a> Parser<'a> {
             let characters = self.parse_comma_separated(Parser::parse_expr)?;
             self.expect_token(&Token::RParen)?;
             Ok(Expr::Trim {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 trim_where: None,
                 trim_what: None,
                 trim_characters: Some(characters),
@@ -3095,7 +3122,7 @@ impl<'a> Parser<'a> {
         } else {
             self.expect_token(&Token::RParen)?;
             Ok(Expr::Trim {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 trim_where,
                 trim_what: None,
                 trim_characters: None,
@@ -3107,15 +3134,12 @@ impl<'a> Parser<'a> {
     ///
     /// See [TrimWhereField]
     pub fn parse_trim_where(&mut self) -> Result<TrimWhereField, ParserError> {
-        let next_token = self.next_token();
-        match &next_token.token {
-            Token::Word(w) => match w.keyword {
-                Keyword::BOTH => Ok(TrimWhereField::Both),
-                Keyword::LEADING => Ok(TrimWhereField::Leading),
-                Keyword::TRAILING => Ok(TrimWhereField::Trailing),
-                _ => self.expected("trim_where field", next_token)?,
-            },
-            _ => self.expected("trim_where field", next_token),
+        self.advance_token();
+        match &self.get_current_token().token {
+            Token::Word(w) if w.keyword == Keyword::BOTH => Ok(TrimWhereField::Both),
+            Token::Word(w) if w.keyword == Keyword::LEADING => Ok(TrimWhereField::Leading),
+            Token::Word(w) if w.keyword == Keyword::TRAILING => Ok(TrimWhereField::Trailing),
+            _ => self.expected_at("trim_where field", self.get_current_index()),
         }
     }
 
@@ -3148,7 +3172,10 @@ impl<'a> Parser<'a> {
                     | Token::NationalStringLiteral(_)
                     | Token::QuoteDelimitedStringLiteral(_)
                     | Token::NationalQuoteDelimitedStringLiteral(_)
-                    | Token::HexStringLiteral(_) => Some(Box::new(self.parse_expr()?)),
+                    | Token::HexStringLiteral(_) => {
+                        let filler = self.parse_expr()?;
+                        Some(self.boxed(filler)?)
+                    }
                     _ => self.expected_ref(
                         "either filler, WITH, or WITHOUT in LISTAGG",
                         self.peek_token_ref(),
@@ -3173,75 +3200,76 @@ impl<'a> Parser<'a> {
     ///
     /// See [`DateTimeField`]
     pub fn parse_date_time_field(&mut self) -> Result<DateTimeField, ParserError> {
-        let next_token = self.next_token();
-        match &next_token.token {
-            Token::Word(w) => match w.keyword {
-                Keyword::YEAR => Ok(DateTimeField::Year),
-                Keyword::YEARS => Ok(DateTimeField::Years),
-                Keyword::MONTH => Ok(DateTimeField::Month),
-                Keyword::MONTHS => Ok(DateTimeField::Months),
-                Keyword::WEEK => {
-                    let week_day = if dialect_of!(self is BigQueryDialect | GenericDialect)
-                        && self.consume_token(&Token::LParen)
-                    {
-                        let week_day = self.parse_identifier()?;
-                        self.expect_token(&Token::RParen)?;
-                        Some(week_day)
-                    } else {
-                        None
-                    };
-                    Ok(DateTimeField::Week(week_day))
-                }
-                Keyword::WEEKS => Ok(DateTimeField::Weeks),
-                Keyword::DAY => Ok(DateTimeField::Day),
-                Keyword::DAYOFWEEK => Ok(DateTimeField::DayOfWeek),
-                Keyword::DAYOFYEAR => Ok(DateTimeField::DayOfYear),
-                Keyword::DAYS => Ok(DateTimeField::Days),
-                Keyword::DATE => Ok(DateTimeField::Date),
-                Keyword::DATETIME => Ok(DateTimeField::Datetime),
-                Keyword::HOUR => Ok(DateTimeField::Hour),
-                Keyword::HOURS => Ok(DateTimeField::Hours),
-                Keyword::MINUTE => Ok(DateTimeField::Minute),
-                Keyword::MINUTES => Ok(DateTimeField::Minutes),
-                Keyword::SECOND => Ok(DateTimeField::Second),
-                Keyword::SECONDS => Ok(DateTimeField::Seconds),
-                Keyword::CENTURY => Ok(DateTimeField::Century),
-                Keyword::DECADE => Ok(DateTimeField::Decade),
-                Keyword::DOY => Ok(DateTimeField::Doy),
-                Keyword::DOW => Ok(DateTimeField::Dow),
-                Keyword::EPOCH => Ok(DateTimeField::Epoch),
-                Keyword::ISODOW => Ok(DateTimeField::Isodow),
-                Keyword::ISOYEAR => Ok(DateTimeField::Isoyear),
-                Keyword::ISOWEEK => Ok(DateTimeField::IsoWeek),
-                Keyword::JULIAN => Ok(DateTimeField::Julian),
-                Keyword::MICROSECOND => Ok(DateTimeField::Microsecond),
-                Keyword::MICROSECONDS => Ok(DateTimeField::Microseconds),
-                Keyword::MILLENIUM => Ok(DateTimeField::Millenium),
-                Keyword::MILLENNIUM => Ok(DateTimeField::Millennium),
-                Keyword::MILLISECOND => Ok(DateTimeField::Millisecond),
-                Keyword::MILLISECONDS => Ok(DateTimeField::Milliseconds),
-                Keyword::NANOSECOND => Ok(DateTimeField::Nanosecond),
-                Keyword::NANOSECONDS => Ok(DateTimeField::Nanoseconds),
-                Keyword::QUARTER => Ok(DateTimeField::Quarter),
-                Keyword::TIME => Ok(DateTimeField::Time),
-                Keyword::TIMEZONE => Ok(DateTimeField::Timezone),
-                Keyword::TIMEZONE_ABBR => Ok(DateTimeField::TimezoneAbbr),
-                Keyword::TIMEZONE_HOUR => Ok(DateTimeField::TimezoneHour),
-                Keyword::TIMEZONE_MINUTE => Ok(DateTimeField::TimezoneMinute),
-                Keyword::TIMEZONE_REGION => Ok(DateTimeField::TimezoneRegion),
-                _ if self.dialect.allow_extract_custom() => {
-                    self.prev_token();
-                    let custom = self.parse_identifier()?;
-                    Ok(DateTimeField::Custom(custom))
-                }
-                _ => self.expected("date/time field", next_token),
-            },
+        self.advance_token();
+        let keyword = match &self.get_current_token().token {
+            Token::Word(w) => w.keyword,
             Token::SingleQuotedString(_) if self.dialect.allow_extract_single_quotes() => {
+                self.prev_token();
+                let custom = self.parse_identifier()?;
+                return Ok(DateTimeField::Custom(custom));
+            }
+            _ => return self.expected_at("date/time field", self.get_current_index()),
+        };
+        match keyword {
+            Keyword::YEAR => Ok(DateTimeField::Year),
+            Keyword::YEARS => Ok(DateTimeField::Years),
+            Keyword::MONTH => Ok(DateTimeField::Month),
+            Keyword::MONTHS => Ok(DateTimeField::Months),
+            Keyword::WEEK => {
+                let week_day = if dialect_of!(self is BigQueryDialect | GenericDialect)
+                    && self.consume_token(&Token::LParen)
+                {
+                    let week_day = self.parse_identifier()?;
+                    self.expect_token(&Token::RParen)?;
+                    Some(week_day)
+                } else {
+                    None
+                };
+                Ok(DateTimeField::Week(week_day))
+            }
+            Keyword::WEEKS => Ok(DateTimeField::Weeks),
+            Keyword::DAY => Ok(DateTimeField::Day),
+            Keyword::DAYOFWEEK => Ok(DateTimeField::DayOfWeek),
+            Keyword::DAYOFYEAR => Ok(DateTimeField::DayOfYear),
+            Keyword::DAYS => Ok(DateTimeField::Days),
+            Keyword::DATE => Ok(DateTimeField::Date),
+            Keyword::DATETIME => Ok(DateTimeField::Datetime),
+            Keyword::HOUR => Ok(DateTimeField::Hour),
+            Keyword::HOURS => Ok(DateTimeField::Hours),
+            Keyword::MINUTE => Ok(DateTimeField::Minute),
+            Keyword::MINUTES => Ok(DateTimeField::Minutes),
+            Keyword::SECOND => Ok(DateTimeField::Second),
+            Keyword::SECONDS => Ok(DateTimeField::Seconds),
+            Keyword::CENTURY => Ok(DateTimeField::Century),
+            Keyword::DECADE => Ok(DateTimeField::Decade),
+            Keyword::DOY => Ok(DateTimeField::Doy),
+            Keyword::DOW => Ok(DateTimeField::Dow),
+            Keyword::EPOCH => Ok(DateTimeField::Epoch),
+            Keyword::ISODOW => Ok(DateTimeField::Isodow),
+            Keyword::ISOYEAR => Ok(DateTimeField::Isoyear),
+            Keyword::ISOWEEK => Ok(DateTimeField::IsoWeek),
+            Keyword::JULIAN => Ok(DateTimeField::Julian),
+            Keyword::MICROSECOND => Ok(DateTimeField::Microsecond),
+            Keyword::MICROSECONDS => Ok(DateTimeField::Microseconds),
+            Keyword::MILLENIUM => Ok(DateTimeField::Millenium),
+            Keyword::MILLENNIUM => Ok(DateTimeField::Millennium),
+            Keyword::MILLISECOND => Ok(DateTimeField::Millisecond),
+            Keyword::MILLISECONDS => Ok(DateTimeField::Milliseconds),
+            Keyword::NANOSECOND => Ok(DateTimeField::Nanosecond),
+            Keyword::NANOSECONDS => Ok(DateTimeField::Nanoseconds),
+            Keyword::QUARTER => Ok(DateTimeField::Quarter),
+            Keyword::TIME => Ok(DateTimeField::Time),
+            Keyword::TIMEZONE => Ok(DateTimeField::Timezone),
+            Keyword::TIMEZONE_ABBR => Ok(DateTimeField::TimezoneAbbr),
+            Keyword::TIMEZONE_HOUR => Ok(DateTimeField::TimezoneHour),
+            Keyword::TIMEZONE_MINUTE => Ok(DateTimeField::TimezoneMinute),
+            Keyword::TIMEZONE_REGION => Ok(DateTimeField::TimezoneRegion),
+            _ if self.dialect.allow_extract_custom() => {
                 self.prev_token();
                 let custom = self.parse_identifier()?;
                 Ok(DateTimeField::Custom(custom))
             }
-            _ => self.expected("date/time field", next_token),
+            _ => self.expected_at("date/time field", self.get_current_index()),
         }
     }
 
@@ -3256,17 +3284,21 @@ impl<'a> Parser<'a> {
                     let _ = self.parse_keyword(Keyword::EXISTS);
                     self.parse_exists_expr(negated)
                 }
-                _ => Ok(Expr::UnaryOp {
-                    op: UnaryOperator::Not,
-                    expr: Box::new(
-                        self.parse_subexpr(self.dialect.prec_value(Precedence::UnaryNot))?,
-                    ),
-                }),
+                _ => {
+                    let expr = self.parse_subexpr(self.dialect.prec_value(Precedence::UnaryNot))?;
+                    Ok(Expr::UnaryOp {
+                        op: UnaryOperator::Not,
+                        expr: self.boxed(expr)?,
+                    })
+                }
             },
-            _ => Ok(Expr::UnaryOp {
-                op: UnaryOperator::Not,
-                expr: Box::new(self.parse_subexpr(self.dialect.prec_value(Precedence::UnaryNot))?),
-            }),
+            _ => {
+                let expr = self.parse_subexpr(self.dialect.prec_value(Precedence::UnaryNot))?;
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: self.boxed(expr)?,
+                })
+            }
         }
     }
 
@@ -3420,7 +3452,7 @@ impl<'a> Parser<'a> {
             };
 
         Ok(Expr::Interval(Interval {
-            value: Box::new(value),
+            value: self.boxed(value)?,
             leading_field,
             leading_precision,
             last_field,
@@ -3527,7 +3559,7 @@ impl<'a> Parser<'a> {
             }
             let field_name = self.parse_identifier()?;
             Ok(Expr::Named {
-                expr: expr.into(),
+                expr: self.boxed(expr)?,
                 name: field_name,
             })
         } else {
@@ -3560,12 +3592,12 @@ impl<'a> Parser<'a> {
         if self.peek_token_ref().token != Token::Lt {
             return Ok((Default::default(), false.into()));
         }
-        self.next_token();
+        self.advance_token();
 
         let mut field_defs = vec![];
         let trailing_bracket = loop {
             let (def, trailing_bracket) = elem_parser(self)?;
-            field_defs.push(def);
+            self.push(&mut field_defs, def)?;
             // The struct field definition is finished if it occurs `>>` or comma.
             if trailing_bracket.0 || !self.consume_token(&Token::Comma) {
                 break trailing_bracket;
@@ -3613,7 +3645,10 @@ impl<'a> Parser<'a> {
         // Look beyond the next item to infer whether both field name
         // and type are specified.
         let is_named_field = matches!(
-            (self.peek_nth_token(0).token, self.peek_nth_token(1).token),
+            (
+                &self.peek_nth_token_ref(0).token,
+                &self.peek_nth_token_ref(1).token
+            ),
             (Token::Word(_), Token::Word(_)) | (Token::Word(_), Token::Colon)
         );
 
@@ -3703,7 +3738,7 @@ impl<'a> Parser<'a> {
 
         Ok(DictionaryField {
             key,
-            value: Box::new(expr),
+            value: self.boxed(expr)?,
         })
     }
 
@@ -3741,8 +3776,8 @@ impl<'a> Parser<'a> {
         let value = self.parse_expr()?;
 
         Ok(MapEntry {
-            key: Box::new(key),
-            value: Box::new(value),
+            key: self.boxed(key)?,
+            value: self.boxed(value)?,
         })
     }
 
@@ -3781,7 +3816,7 @@ impl<'a> Parser<'a> {
         let mut field_defs = vec![];
         loop {
             let (def, _) = self.parse_struct_field_def()?;
-            field_defs.push(def);
+            self.push(&mut field_defs, def)?;
             if !self.consume_token(&Token::Comma) {
                 break;
             }
@@ -3802,11 +3837,11 @@ impl<'a> Parser<'a> {
         let trailing_bracket = if !trailing_bracket.0 {
             match &self.peek_token_ref().token {
                 Token::Gt => {
-                    self.next_token();
+                    self.advance_token();
                     false.into()
                 }
                 Token::ShiftRight => {
-                    self.next_token();
+                    self.advance_token();
                     true.into()
                 }
                 _ => return self.expected_ref(">", self.peek_token_ref()),
@@ -4077,13 +4112,19 @@ impl<'a> Parser<'a> {
                             self.boxed(expr)?,
                             self.boxed(expr2)?,
                         ))
-                    } else if let Ok(is_normalized) = self.parse_unicode_is_normalized(expr) {
-                        Ok(is_normalized)
                     } else {
-                        self.expected_ref(
-                            "[NOT] NULL | TRUE | FALSE | DISTINCT | [form] NORMALIZED FROM after IS",
-                            self.peek_token_ref(),
-                        )
+                        match self.parse_unicode_is_normalized(expr) {
+                            Ok(is_normalized) => Ok(is_normalized),
+                            // A refusal is not a failed parse: there is no alternative to try.
+                            Err(refused @ ParserError::OutOfMemory { .. }) => Err(refused),
+                            Err(error) => {
+                                self.discarded(error);
+                                self.expected_ref(
+                                    "[NOT] NULL | TRUE | FALSE | DISTINCT | [form] NORMALIZED FROM after IS",
+                                    self.peek_token_ref(),
+                                )
+                            }
+                        }
                     }
                 }
                 Keyword::AT => {
@@ -4323,8 +4364,8 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_json_path_object_key(&mut self) -> Result<JsonPathElem, ParserError> {
-        let token = self.next_token();
-        match token.token {
+        self.advance_token();
+        match &self.get_current_token().token {
             Token::Word(Word {
                 value,
                 // path segments in SF dot notation can be unquoted or double-quoted;
@@ -4334,23 +4375,26 @@ impl<'a> Parser<'a> {
                 // any keyword here unquoted.
                 keyword: _,
             }) => Ok(JsonPathElem::Dot {
-                key: value,
+                key: self.string(value)?,
                 quoted: quote_style.is_some(),
             }),
 
             // This token should never be generated on snowflake or generic
             // dialects, but we handle it just in case this is used on future
             // dialects.
-            Token::DoubleQuotedString(key) => Ok(JsonPathElem::Dot { key, quoted: true }),
+            Token::DoubleQuotedString(key) => Ok(JsonPathElem::Dot {
+                key: self.string(key)?,
+                quoted: true,
+            }),
 
-            _ => self.expected("variant object key name", token),
+            _ => self.expected_at("variant object key name", self.get_current_index()),
         }
     }
 
     fn parse_json_access(&mut self, expr: Expr) -> Result<Expr, ParserError> {
         let path = self.parse_json_path()?;
         Ok(Expr::JsonAccess {
-            value: Box::new(expr),
+            value: self.boxed(expr)?,
             path,
         })
     }
@@ -4358,30 +4402,28 @@ impl<'a> Parser<'a> {
     fn parse_json_path(&mut self) -> Result<JsonPath, ParserError> {
         let mut path = Vec::new();
         loop {
-            match self.next_token().token {
-                Token::Colon if path.is_empty() && self.peek_token_ref() == &Token::LBracket => {
-                    self.next_token();
-                    let key = self.parse_wildcard_expr()?;
-                    self.expect_token(&Token::RBracket)?;
-                    path.push(JsonPathElem::ColonBracket { key });
-                }
-                Token::Colon if path.is_empty() => {
-                    path.push(self.parse_json_path_object_key()?);
-                }
-                Token::Period if !path.is_empty() => {
-                    path.push(self.parse_json_path_object_key()?);
-                }
-                Token::LBracket => {
-                    let key = self.parse_wildcard_expr()?;
-                    self.expect_token(&Token::RBracket)?;
+            self.advance_token();
+            let token = &self.get_current_token().token;
+            let colon = *token == Token::Colon;
+            let period = *token == Token::Period;
+            let bracket = *token == Token::LBracket;
+            if colon && path.is_empty() && self.peek_token_ref() == &Token::LBracket {
+                self.advance_token();
+                let key = self.parse_wildcard_expr()?;
+                self.expect_token(&Token::RBracket)?;
+                self.push(&mut path, JsonPathElem::ColonBracket { key })?;
+            } else if (colon && path.is_empty()) || (period && !path.is_empty()) {
+                let key = self.parse_json_path_object_key()?;
+                self.push(&mut path, key)?;
+            } else if bracket {
+                let key = self.parse_wildcard_expr()?;
+                self.expect_token(&Token::RBracket)?;
 
-                    path.push(JsonPathElem::Bracket { key });
-                }
-                _ => {
-                    self.prev_token();
-                    break;
-                }
-            };
+                self.push(&mut path, JsonPathElem::Bracket { key })?;
+            } else {
+                self.prev_token();
+                break;
+            }
         }
 
         debug_assert!(!path.is_empty());
@@ -4397,20 +4439,20 @@ impl<'a> Parser<'a> {
             let array_expr = self.parse_expr()?;
             self.expect_token(&Token::RParen)?;
             return Ok(Expr::InUnnest {
-                expr: Box::new(expr),
-                array_expr: Box::new(array_expr),
+                expr: self.boxed(expr)?,
+                array_expr: self.boxed(array_expr)?,
                 negated,
             });
         }
         self.expect_token(&Token::LParen)?;
         let in_op = match self.maybe_parse(|p| p.parse_query())? {
             Some(subquery) => Expr::InSubquery {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 subquery,
                 negated,
             },
             None => Expr::InList {
-                expr: Box::new(expr),
+                expr: self.boxed(expr)?,
                 list: if self.dialect.supports_in_empty_list() {
                     self.parse_comma_separated0(Parser::parse_expr, Token::RParen)?
                 } else {
@@ -4431,18 +4473,19 @@ impl<'a> Parser<'a> {
         self.expect_keyword_is(Keyword::AND)?;
         let high = self.parse_subexpr(self.dialect.prec_value(Precedence::Between))?;
         Ok(Expr::Between {
-            expr: Box::new(expr),
+            expr: self.boxed(expr)?,
             negated,
-            low: Box::new(low),
-            high: Box::new(high),
+            low: self.boxed(low)?,
+            high: self.boxed(high)?,
         })
     }
 
     /// Parse a PostgreSQL casting style which is in the form of `expr::datatype`.
     pub fn parse_pg_cast(&mut self, expr: Expr) -> Result<Expr, ParserError> {
+        let expr = self.boxed(expr)?;
         Ok(Expr::Cast {
             kind: CastKind::DoubleColon,
-            expr: Box::new(expr),
+            expr,
             data_type: self.parse_data_type()?,
             array: false,
             format: None,
@@ -4956,7 +4999,8 @@ impl<'a> Parser<'a> {
     pub fn parse_actions_list(&mut self) -> Result<Vec<Action>, ParserError> {
         let mut values = vec![];
         loop {
-            values.push(self.parse_grant_permission()?);
+            let action = self.parse_grant_permission()?;
+            self.push(&mut values, action)?;
             if !self.consume_token(&Token::Comma) {
                 break;
             } else if self.options.trailing_commas {

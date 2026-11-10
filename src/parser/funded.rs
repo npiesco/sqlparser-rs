@@ -413,4 +413,12 @@ impl<'a> Parser<'a> {
         self.funding.discharge(made);
         self.kept.set(before);
     }
+
+    /// `value`, if any, in a block of its own, handed out.
+    pub(crate) fn maybe_boxed<T>(&self, value: Option<T>) -> Result<Option<Box<T>>, ParserError> {
+        match value {
+            Some(value) => self.boxed(value).map(Some),
+            None => Ok(None),
+        }
+    }
 }
