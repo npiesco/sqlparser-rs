@@ -66,6 +66,82 @@ visitor = ["sqlparser_derive"]
 name = "sqlparser"
 path = "src/lib.rs"
 
+[[test]]
+name = "pretty_print"
+path = "tests/pretty_print.rs"
+
+[[test]]
+name = "sqlparser_bigquery"
+path = "tests/sqlparser_bigquery.rs"
+
+[[test]]
+name = "sqlparser_clickhouse"
+path = "tests/sqlparser_clickhouse.rs"
+
+[[test]]
+name = "sqlparser_comments"
+path = "tests/sqlparser_comments.rs"
+
+[[test]]
+name = "sqlparser_common"
+path = "tests/sqlparser_common.rs"
+
+[[test]]
+name = "sqlparser_custom_dialect"
+path = "tests/sqlparser_custom_dialect.rs"
+
+[[test]]
+name = "sqlparser_databricks"
+path = "tests/sqlparser_databricks.rs"
+
+[[test]]
+name = "sqlparser_duckdb"
+path = "tests/sqlparser_duckdb.rs"
+
+[[test]]
+name = "sqlparser_hive"
+path = "tests/sqlparser_hive.rs"
+
+[[test]]
+name = "sqlparser_mssql"
+path = "tests/sqlparser_mssql.rs"
+
+[[test]]
+name = "sqlparser_mysql"
+path = "tests/sqlparser_mysql.rs"
+
+[[test]]
+name = "sqlparser_oracle"
+path = "tests/sqlparser_oracle.rs"
+
+[[test]]
+name = "sqlparser_postgres"
+path = "tests/sqlparser_postgres.rs"
+
+[[test]]
+name = "sqlparser_redshift"
+path = "tests/sqlparser_redshift.rs"
+
+[[test]]
+name = "sqlparser_regression"
+path = "tests/sqlparser_regression.rs"
+
+[[test]]
+name = "sqlparser_snowflake"
+path = "tests/sqlparser_snowflake.rs"
+
+[[test]]
+name = "sqlparser_spark"
+path = "tests/sqlparser_spark.rs"
+
+[[test]]
+name = "sqlparser_sqlite"
+path = "tests/sqlparser_sqlite.rs"
+
+[[test]]
+name = "sqlparser_teradata"
+path = "tests/sqlparser_teradata.rs"
+
 [dependencies.bigdecimal]
 version = "0.4.1"
 features = ["serde"]
