@@ -26,7 +26,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use log::debug;
 
 use crate::dialect::{Dialect, Precedence};
 use crate::keywords::Keyword;
@@ -116,7 +115,6 @@ impl Dialect for PostgreSqlDialect {
 
     fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
         let token = parser.peek_token_ref();
-        debug!("get_next_precedence() {token:?}");
 
         // we only return some custom value here when the behaviour (not merely the numeric value) differs
         // from the default implementation

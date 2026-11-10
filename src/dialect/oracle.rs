@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use log::debug;
-
 use crate::{
     parser::{Parser, ParserError},
     tokenizer::Token,
@@ -87,7 +85,6 @@ impl Dialect for OracleDialect {
 
     fn get_next_precedence(&self, parser: &Parser) -> Option<Result<u8, ParserError>> {
         let t = parser.peek_token_ref();
-        debug!("get_next_precedence() {t:?}");
 
         match &t.token {
             Token::StringConcat => Some(Ok(self.prec_value(Precedence::PlusMinus))),

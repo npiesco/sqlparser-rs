@@ -44,7 +44,7 @@ use crate::dialect::{
     BigQueryDialect, DuckDbDialect, GenericDialect, MySqlDialect, PostgreSqlDialect,
     SnowflakeDialect,
 };
-use crate::funding::{Funding, Held, Refused, UNFUNDED};
+use crate::funding::{Funding, Held, Measure, Refused, UNFUNDED};
 use crate::keywords::{Keyword, ALL_KEYWORDS, ALL_KEYWORDS_INDEX};
 use crate::{
     ast::{DollarQuotedString, QuoteDelimitedString},
@@ -845,12 +845,17 @@ pub trait TokenizerFunding {
     fn discharge(&self, bytes: usize);
 }
 
-impl Funding<'_> {
+impl<'f> Funding<'f> {
     /// The syntax error at `location`, its message charged before it is made: out of memory if
     /// that is refused. The message's charge goes with the error, to be given back by whoever
     /// frees it.
+    ///
+    /// The message's block has room for the location written after it as well, so that the
+    /// error written out whole fits in it (as [`ParserError`] writes it), allocating nothing.
+    ///
+    /// [`ParserError`]: crate::parser::ParserError
     fn error(self, location: Location, message: fmt::Arguments<'_>) -> TokenizerError {
-        match self.format(message) {
+        match self.whole(location, message) {
             Ok(message) => TokenizerError {
                 message: message.keep(),
                 location,
@@ -858,6 +863,21 @@ impl Funding<'_> {
             },
             Err(refused) => refused.into(),
         }
+    }
+
+    /// `message` written out in a block with exactly the room for it and `location` after it.
+    fn whole(
+        self,
+        location: Location,
+        message: fmt::Arguments<'_>,
+    ) -> Result<Held<'f, String>, Refused> {
+        let mut room = Measure(0);
+        fmt::write(&mut room, format_args!("{message}{location}"))
+            .map_err(|_| Refused { needed: 0 })?;
+        let mut made = self.text();
+        made.reserve_exact(room.0)?;
+        fmt::write(&mut made.buffer, message).map_err(|_| Refused { needed: room.0 })?;
+        Ok(made)
     }
 }
 

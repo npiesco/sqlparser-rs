@@ -27,8 +27,6 @@ use core::{
 };
 use helpers::attached_token::AttachedToken;
 
-use log::debug;
-
 use IsLateral::*;
 use IsOptional::*;
 
@@ -43,7 +41,7 @@ use crate::ast::{
     },
 };
 use crate::dialect::*;
-use crate::funding::{Funding, Refused, UNFUNDED};
+use crate::funding::{Funding, Measure, Refused, UNFUNDED};
 use crate::keywords::{Keyword, ALL_KEYWORDS};
 use crate::tokenizer::*;
 use sqlparser::parser::ParserState::ColumnDefinition;
@@ -126,8 +124,28 @@ pub enum WildcardExpr {
 }
 
 impl From<TokenizerError> for ParserError {
-    fn from(e: TokenizerError) -> Self {
-        ParserError::TokenizerError(e.to_string())
+    /// The tokenizer's error written out whole in the block its message holds, allocating
+    /// nothing: what was charged for that block goes with it. The tokenizer makes room there
+    /// for the location; a message made elsewhere without that room is kept without it.
+    fn from(error: TokenizerError) -> Self {
+        let TokenizerError {
+            mut message,
+            location,
+            kind,
+        } = error;
+        match kind {
+            TokenizerErrorKind::OutOfMemory => ParserError::OutOfMemory { needed: 0 },
+            TokenizerErrorKind::Syntax => {
+                let mut room = Measure(0);
+                let fits = fmt::write(&mut room, format_args!("{location}")).is_ok()
+                    && message.capacity() - message.len() >= room.0;
+                if fits {
+                    // Within the room it has, writing reallocates nothing, and cannot fail.
+                    let _ = fmt::write(&mut message, format_args!("{location}"));
+                }
+                ParserError::TokenizerError(message)
+            }
+        }
     }
 }
 
@@ -435,7 +453,6 @@ impl<'a> Parser<'a> {
     ///
     /// See example on [`Parser::new()`] for an example
     pub fn try_with_sql(self, sql: &str) -> Result<Self, ParserError> {
-        debug!("Parsing sql '{sql}'...");
         let tokens = Tokenizer::new(self.dialect, sql)
             .with_unescape(self.options.unescape)
             .tokenize_with_location();
@@ -1398,7 +1415,6 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_subexpr_within(&mut self, precedence: u8) -> Result<Expr, ParserError> {
-        debug!("parsing expr");
         let mut expr = self.parse_prefix()?;
 
         expr = self.parse_compound_expr(expr, vec![])?;
@@ -1414,10 +1430,8 @@ impl<'a> Parser<'a> {
             };
         }
 
-        debug!("prefix: {expr:?}");
         loop {
             let next_precedence = self.get_next_precedence()?;
-            debug!("next precedence: {next_precedence:?}");
 
             if precedence >= next_precedence {
                 break;
@@ -3815,7 +3829,6 @@ impl<'a> Parser<'a> {
 
         self.advance_token();
         let tok = self.get_current_token();
-        debug!("infix: {tok:?}");
         let tok_index = self.get_current_index();
         let span = tok.span;
         let regular_binary_operator = match &tok.token {
