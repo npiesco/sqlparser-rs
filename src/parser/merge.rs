@@ -113,6 +113,7 @@ impl Parser<'_> {
                         MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget
                     ) {
                         return parser_err!(
+                            self,
                             format_args!("UPDATE is not allowed in a {clause_kind} merge clause"),
                             self.get_current_token().span.start
                         );
@@ -127,7 +128,7 @@ impl Parser<'_> {
                         None
                     };
                     let delete_predicate = if self.parse_keyword(Keyword::DELETE) {
-                        let _ = self.expect_keyword(Keyword::WHERE)?;
+                        self.expect_keyword_is(Keyword::WHERE)?;
                         Some(self.parse_expr()?)
                     } else {
                         None
@@ -145,6 +146,7 @@ impl Parser<'_> {
                         MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget
                     ) {
                         return parser_err!(
+                            self,
                             format_args!("DELETE is not allowed in a {clause_kind} merge clause"),
                             self.get_current_token().span.start
                         );
@@ -161,6 +163,7 @@ impl Parser<'_> {
                         MergeClauseKind::NotMatched | MergeClauseKind::NotMatchedByTarget
                     ) {
                         return parser_err!(
+                            self,
                             format_args!("INSERT is not allowed in a {clause_kind} merge clause"),
                             self.get_current_token().span.start
                         );
@@ -196,6 +199,7 @@ impl Parser<'_> {
                 }
                 _ => {
                     return parser_err!(
+                        self,
                         "expected UPDATE, DELETE or INSERT in merge clause",
                         self.peek_token_ref().span.start
                     );

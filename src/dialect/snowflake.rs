@@ -1900,7 +1900,7 @@ fn parse_multi_table_insert_when_clauses(
     // Parse WHEN clauses
     while parser.parse_keyword(Keyword::WHEN) {
         let condition = parser.parse_expr()?;
-        parser.expect_keyword(Keyword::THEN)?;
+        parser.expect_keyword_is(Keyword::THEN)?;
 
         // Parse INTO clauses for this WHEN
         let into_clauses = parse_multi_table_insert_into_clauses(parser)?;
