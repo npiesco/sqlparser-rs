@@ -1432,12 +1432,18 @@ pub fn parse_copy_into(parser: &mut Parser) -> Result<Statement, ParserError> {
             parser.expect_token(&Token::Eq)?;
             copy_options = parser.parse_key_value_options(true, &[])?.options;
         } else {
-            match parser.next_token().token {
+            parser.advance_token();
+            let at = parser.get_current_index();
+            match &parser.token_at(at).token {
                 Token::SemiColon | Token::EOF => break,
                 Token::Comma => continue,
                 // In `COPY INTO <location>` the copy options do not have a shared key
                 // like in `COPY INTO <table>`
-                Token::Word(key) => copy_options.push(parser.parse_key_value_option(&key)?),
+                Token::Word(key) => {
+                    let option_name = parser.string(&key.value)?;
+                    let option = parser.parse_key_value_option(option_name)?;
+                    parser.push(&mut copy_options, option)?;
+                }
                 _ => {
                     return parser
                         .expected_ref("another copy option, ; or EOF'", parser.peek_token_ref())
@@ -1632,41 +1638,37 @@ fn parse_session_options(
     set: bool,
 ) -> Result<Vec<KeyValueOption>, ParserError> {
     let mut options: Vec<KeyValueOption> = Vec::new();
-    let empty = String::new;
     loop {
-        let peeked_token = parser.peek_token();
-        match peeked_token.token {
+        let peeked_token = parser.peek_token_ref();
+        match &peeked_token.token {
             Token::SemiColon | Token::EOF => break,
             Token::Comma => {
                 parser.advance_token();
                 continue;
             }
             Token::Word(key) => {
+                let end = peeked_token.span.end;
+                let option_name = parser.string(&key.value)?;
                 parser.advance_token();
-                if set {
-                    let option = parser.parse_key_value_option(&key)?;
-                    options.push(option);
+                let option = if set {
+                    parser.parse_key_value_option(option_name)?
                 } else {
-                    options.push(KeyValueOption {
-                        option_name: key.value,
+                    KeyValueOption {
+                        option_name,
                         option_value: KeyValueOptionKind::Single(
-                            Value::Placeholder(empty()).with_span(Span {
-                                start: peeked_token.span.end,
-                                end: peeked_token.span.end,
-                            }),
+                            Value::Placeholder(String::new()).with_span(Span { start: end, end }),
                         ),
-                    });
-                }
+                    }
+                };
+                parser.push(&mut options, option)?;
             }
             _ => {
-                return parser.expected("another option or end of statement", peeked_token);
+                return parser.expected_ref("another option or end of statement", peeked_token);
             }
         }
     }
     if options.is_empty() {
-        Err(ParserError::ParserError(
-            "expected at least one option".to_string(),
-        ))
+        Err(parser.error(format_args!("expected at least one option")))
     } else {
         Ok(options)
     }
