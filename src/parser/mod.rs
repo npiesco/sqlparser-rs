@@ -13454,7 +13454,8 @@ impl<'a> Parser<'a> {
             let token = self.peek_token_ref();
             match &token.token {
                 Token::Word(w) => {
-                    idents.push(w.to_ident(token.span));
+                    let ident = self.ident(w, token.span)?;
+                    self.push(&mut idents, ident)?;
                 }
                 Token::EOF | Token::Eq | Token::SemiColon | Token::VerticalBarRightAngleBracket => {
                     break
@@ -13509,40 +13510,47 @@ impl<'a> Parser<'a> {
         let mut idents = vec![];
 
         // expecting at least one word for identifier
-        let next_token = self.next_token();
-        match next_token.token {
-            Token::Word(w) => idents.push(w.into_ident(next_token.span)),
+        self.advance_token();
+        let next_token = self.get_current_token();
+        match &next_token.token {
+            Token::Word(w) => {
+                let ident = self.ident(w, next_token.span)?;
+                self.push(&mut idents, ident)?;
+            }
             Token::EOF => {
-                return Err(self.error(format_args!("Empty input when parsing identifier")))?
+                return Err(self.error(format_args!("Empty input when parsing identifier")))
             }
             token => {
-                return Err(self.error(format_args!("Unexpected token in identifier: {token}")))?
+                return Err(self.error(format_args!("Unexpected token in identifier: {token}")))
             }
         };
 
         // parse optional next parts if exist
         loop {
-            match self.next_token().token {
+            self.advance_token();
+            match &self.get_current_token().token {
                 // ensure that optional period is succeeded by another identifier
                 Token::Period => {
-                    let next_token = self.next_token();
-                    match next_token.token {
-                        Token::Word(w) => idents.push(w.into_ident(next_token.span)),
+                    self.advance_token();
+                    let next_token = self.get_current_token();
+                    match &next_token.token {
+                        Token::Word(w) => {
+                            let ident = self.ident(w, next_token.span)?;
+                            self.push(&mut idents, ident)?;
+                        }
                         Token::EOF => {
-                            return Err(self.error(format_args!("Trailing period in identifier")))?
+                            return Err(self.error(format_args!("Trailing period in identifier")))
                         }
                         token => {
                             return Err(self.error(format_args!(
                                 "Unexpected token following period in identifier: {token}"
-                            )))?
+                            )))
                         }
                     }
                 }
                 Token::EOF => break,
                 token => {
-                    return Err(
-                        self.error(format_args!("Unexpected token in identifier: {token}"))
-                    )?;
+                    return Err(self.error(format_args!("Unexpected token in identifier: {token}")));
                 }
             }
         }
@@ -13573,71 +13581,75 @@ impl<'a> Parser<'a> {
     ///
     /// Return a tuple of the identifier and a boolean indicating it ends with a period.
     fn parse_unquoted_hyphenated_identifier(&mut self) -> Result<(Ident, bool), ParserError> {
-        match self.peek_token().token {
-            Token::Word(w) => {
-                let quote_style_is_none = w.quote_style.is_none();
-                let mut requires_whitespace = false;
-                let mut ident = w.into_ident(self.next_token().span);
-                if quote_style_is_none {
-                    while matches!(self.peek_token_no_skip().token, Token::Minus) {
-                        self.next_token();
-                        ident.value.push('-');
+        let quote_style_is_none = match &self.peek_token_ref().token {
+            Token::Word(w) => w.quote_style.is_none(),
+            _ => return Ok((self.parse_identifier()?, false)),
+        };
+        let mut requires_whitespace = false;
+        let mut ident = self.parse_identifier()?;
+        if quote_style_is_none {
+            while matches!(self.peek_nth_token_no_skip_ref(0).token, Token::Minus) {
+                self.advance_token();
+                self.grow(&mut ident.value, 1)?;
+                ident.value.push('-');
 
-                        let token = self
-                            .next_token_no_skip()
-                            .cloned()
-                            .unwrap_or(TokenWithSpan::wrap(Token::EOF));
-                        requires_whitespace = match token.token {
-                            Token::Word(next_word) if next_word.quote_style.is_none() => {
-                                ident.value.push_str(&next_word.value);
-                                false
+                self.next_token_no_skip();
+                let at = self.index - 1;
+                let token = self.token_at(at);
+                requires_whitespace =
+                    match &token.token {
+                        Token::Word(next_word) if next_word.quote_style.is_none() => {
+                            self.grow(&mut ident.value, next_word.value.len())?;
+                            ident.value.push_str(&next_word.value);
+                            false
+                        }
+                        Token::Number(s, false) => {
+                            // A number token can represent a decimal value ending with a period, e.g., `Number('123.')`.
+                            // However, for an [ObjectName], it is part of a hyphenated identifier, e.g., `foo-123.bar`.
+                            //
+                            // If a number token is followed by a period, it is part of an [ObjectName].
+                            // Return the identifier with `true` if the number token is followed by a period, indicating that
+                            // parsing should continue for the next part of the hyphenated identifier.
+                            if s.ends_with('.') {
+                                let Some(s) = s.split('.').next().filter(|s| {
+                                    !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
+                                }) else {
+                                    return self
+                                        .expected_at("continuation of hyphenated identifier", at);
+                                };
+                                self.grow(&mut ident.value, s.len())?;
+                                ident.value.push_str(s);
+                                return Ok((ident, true));
+                            } else {
+                                self.grow(&mut ident.value, s.len())?;
+                                ident.value.push_str(s);
                             }
-                            Token::Number(s, false) => {
-                                // A number token can represent a decimal value ending with a period, e.g., `Number('123.')`.
-                                // However, for an [ObjectName], it is part of a hyphenated identifier, e.g., `foo-123.bar`.
-                                //
-                                // If a number token is followed by a period, it is part of an [ObjectName].
-                                // Return the identifier with `true` if the number token is followed by a period, indicating that
-                                // parsing should continue for the next part of the hyphenated identifier.
-                                if s.ends_with('.') {
-                                    let Some(s) = s.split('.').next().filter(|s| {
-                                        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
-                                    }) else {
-                                        return self.expected(
-                                            "continuation of hyphenated identifier",
-                                            TokenWithSpan::new(Token::Number(s, false), token.span),
-                                        );
-                                    };
-                                    ident.value.push_str(s);
-                                    return Ok((ident, true));
-                                } else {
-                                    ident.value.push_str(&s);
-                                }
-                                // If next token is period, then it is part of an ObjectName and we don't expect whitespace
-                                // after the number.
-                                !matches!(self.peek_token_ref().token, Token::Period)
-                            }
-                            _ => {
-                                return self
-                                    .expected("continuation of hyphenated identifier", token);
-                            }
+                            // If next token is period, then it is part of an ObjectName and we don't expect whitespace
+                            // after the number.
+                            !matches!(self.peek_token_ref().token, Token::Period)
+                        }
+                        _ => {
+                            return self.expected_at("continuation of hyphenated identifier", at);
                         }
                     }
-
-                    // If the last segment was a number, we must check that it's followed by whitespace,
-                    // otherwise foo-123a will be parsed as `foo-123` with the alias `a`.
-                    if requires_whitespace {
-                        let token = self.next_token();
-                        if !matches!(token.token, Token::EOF | Token::Whitespace(_)) {
-                            return self
-                                .expected("whitespace following hyphenated identifier", token);
-                        }
-                    }
-                }
-                Ok((ident, false))
             }
-            _ => Ok((self.parse_identifier()?, false)),
+
+            // If the last segment was a number, we must check that it's followed by whitespace,
+            // otherwise foo-123a will be parsed as `foo-123` with the alias `a`.
+            if requires_whitespace {
+                self.advance_token();
+                if !matches!(
+                    self.get_current_token().token,
+                    Token::EOF | Token::Whitespace(_)
+                ) {
+                    return self.expected_at(
+                        "whitespace following hyphenated identifier",
+                        self.get_current_index(),
+                    );
+                }
+            }
         }
+        Ok((ident, false))
     }
 
     /// Parses a parenthesized, comma-separated list of column definitions within a view.
@@ -13751,7 +13763,7 @@ impl<'a> Parser<'a> {
     {
         if self.consume_token(&Token::LParen) {
             if allow_empty && self.peek_token_ref().token == Token::RParen {
-                self.next_token();
+                self.advance_token();
                 Ok(vec![])
             } else {
                 let cols = self.parse_comma_separated(|p| f(p))?;
@@ -13999,10 +14011,8 @@ impl<'a> Parser<'a> {
         let current_token = self.peek_token_ref();
         match &current_token.token {
             Token::Number(s, _) => {
-                let s = s.clone();
-                let span_start = current_token.span.start;
+                let value = self.parse::<i64>(s, current_token.span.start)?;
                 self.advance_token();
-                let value = self.parse::<i64>(&s, span_start)?;
                 Ok(if is_negative { -value } else { value })
             }
             _ => self.expected_ref("number", current_token),
