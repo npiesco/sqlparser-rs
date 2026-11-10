@@ -5379,11 +5379,13 @@ impl<'a> Parser<'a> {
         let mut name = None;
         if self.peek_token_ref().token != Token::LParen {
             if self.parse_keyword(Keyword::IN) {
+                let before = self.kept.get();
                 let made = self.parse_identifier();
-                storage_specifier = self.optional(made)?;
+                storage_specifier = self.optional(before, made)?;
             } else {
+                let before = self.kept.get();
                 let made = self.parse_identifier();
-                name = self.optional(made)?;
+                name = self.optional(before, made)?;
             }
 
             // Storage specifier may follow the name
@@ -5391,8 +5393,9 @@ impl<'a> Parser<'a> {
                 && self.peek_token_ref().token != Token::LParen
                 && self.parse_keyword(Keyword::IN)
             {
+                let before = self.kept.get();
                 let made = self.parse_identifier();
-                storage_specifier = self.optional(made)?;
+                storage_specifier = self.optional(before, made)?;
             }
         }
 
@@ -6339,8 +6342,9 @@ impl<'a> Parser<'a> {
         let table_name = self.parse_object_name(false)?;
 
         let referenced_table_name = if self.parse_keyword(Keyword::FROM) {
+            let before = self.kept.get();
             let made = self.parse_object_name(true);
-            self.optional(made)?
+            self.optional(before, made)?
         } else {
             None
         };
@@ -7725,8 +7729,9 @@ impl<'a> Parser<'a> {
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
         let name = self.parse_identifier()?;
         let storage_specifier = if self.parse_keyword(Keyword::FROM) {
+            let before = self.kept.get();
             let made = self.parse_identifier();
-            self.optional(made)?
+            self.optional(before, made)?
         } else {
             None
         };
@@ -8700,8 +8705,9 @@ impl<'a> Parser<'a> {
         let like = self.maybe_parse_create_table_like(allow_unquoted_hyphen)?;
 
         let clone = if self.parse_keyword(Keyword::CLONE) {
+            let before = self.kept.get();
             let made = self.parse_object_name(allow_unquoted_hyphen);
-            self.optional(made)?
+            self.optional(before, made)?
         } else {
             None
         };
@@ -15457,8 +15463,9 @@ impl<'a> Parser<'a> {
             let value = if let Some(expr) = self.try_parse_expr_sub_query()? {
                 expr
             } else {
+                let before = self.kept.get();
                 let made = self.parse_expr();
-                match self.optional(made)? {
+                match self.optional(before, made)? {
                     Some(expr) => expr,
                     None => self.expected_ref("variable value", self.peek_token_ref())?,
                 }
@@ -16443,8 +16450,9 @@ impl<'a> Parser<'a> {
                 Err(e) => return Err(e),
             };
 
+            let before = self.kept.get();
             let made = self.expect_keywords(&[Keyword::WITH, Keyword::OFFSET]);
-            let with_offset = self.optional(made)?.is_some();
+            let with_offset = self.optional(before, made)?.is_some();
 
             let with_offset_alias = if with_offset {
                 match self.parse_optional_alias(keywords::RESERVED_FOR_COLUMN_ALIAS) {
@@ -16837,8 +16845,9 @@ impl<'a> Parser<'a> {
         if self.parse_keyword(Keyword::PASSING) {
             loop {
                 let by_value = self.parse_keyword(Keyword::BY) && {
+                    let before = self.kept.get();
                     let made = self.expect_keyword_is(Keyword::VALUE);
-                    self.optional(made)?.is_some()
+                    self.optional(before, made)?.is_some()
                 };
                 let expr = self.parse_expr()?;
                 let alias = if self.parse_keyword(Keyword::AS) {
@@ -20974,17 +20983,38 @@ impl<'a> Parser<'a> {
 
     // Funded helpers for the statement, DDL and query paths.
 
-    /// What `made` made, or `None` if it failed to parse: the error it failed with is freed and
-    /// given back. A refusal is not a failed parse: it is returned.
-    fn optional<T>(&self, made: Result<T, ParserError>) -> Result<Option<T>, ParserError> {
+    /// What `made` made, or `None` if it failed to parse: all it made since [`Parser::kept`] was
+    /// `before`, the error it failed with included, is freed and given back. A refusal is not a
+    /// failed parse: it is returned.
+    fn optional<T>(
+        &self,
+        before: usize,
+        made: Result<T, ParserError>,
+    ) -> Result<Option<T>, ParserError> {
         match made {
             Ok(made) => Ok(Some(made)),
             Err(refused @ ParserError::OutOfMemory { .. }) => Err(refused),
             Err(error) => {
-                self.discarded(error);
+                // All that was made since `before` was freed as it failed, the error with it.
+                drop(error);
+                self.dropped(before);
                 Ok(None)
             }
         }
+    }
+
+    /// What `idents` (a list handed out holding `held` bytes) display as, one string each: the
+    /// strings are charged before they are made, and `idents`, freed, is given back.
+    fn displayed(&self, idents: Vec<Ident>, held: usize) -> Result<Vec<String>, ParserError> {
+        let mut shown = self.list();
+        shown.reserve_exact(idents.len())?;
+        for ident in &idents {
+            let text = self.format(format_args!("{ident}"))?;
+            shown.push(text)?;
+        }
+        let shown = self.keep(shown);
+        self.freed(idents, held);
+        Ok(shown)
     }
 
     /// The number the `Token::Number` at `index` holds, parsed in place.
