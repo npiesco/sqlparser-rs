@@ -501,6 +501,9 @@ mod tests {
             "SELECT 'it''s', 1 WHERE false",
             "SELECT a, b FROM t WHERE x > 1",
             "CREATE VIEW v AS SELECT a FROM t",
+            "COMMENT ON TABLE t IS 'x'",
+            "FLUSH RELAY LOGS FOR CHANNEL c",
+            "FLUSH TABLES a, b WITH READ LOCK",
         ] {
             let ample = Limited::new(usize::MAX);
             assert_eq!(parsed(&ample, sql), Ok(1), "{sql}");

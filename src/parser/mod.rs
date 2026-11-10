@@ -844,7 +844,7 @@ impl<'a> Parser<'a> {
         &mut self,
         terminal_keywords: &[Keyword],
     ) -> Result<ConditionalStatementBlock, ParserError> {
-        let start_token = self.get_current_token().clone(); // self.expect_keyword(keyword)?;
+        let start_token = self.copied(self.get_current_token())?;
         let mut then_token = None;
 
         let condition = match &start_token.token {
@@ -916,62 +916,37 @@ impl<'a> Parser<'a> {
         let if_exists = self.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
 
         self.expect_keyword_is(Keyword::ON)?;
-        let token = self.next_token();
+        self.advance_token();
+        let at = self.get_current_index();
+        let keyword = match &self.get_current_token().token {
+            Token::Word(w) => w.keyword,
+            _ => Keyword::NoKeyword,
+        };
 
-        let (object_type, object_name) = match token.token {
-            Token::Word(w) if w.keyword == Keyword::COLLATION => {
-                (CommentObject::Collation, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::COLUMN => {
-                (CommentObject::Column, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::DATABASE => {
-                (CommentObject::Database, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::DOMAIN => {
-                (CommentObject::Domain, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::EXTENSION => {
-                (CommentObject::Extension, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::FUNCTION => {
-                (CommentObject::Function, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::INDEX => {
-                (CommentObject::Index, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::MATERIALIZED => {
+        let (object_type, object_name) = match keyword {
+            Keyword::COLLATION => (CommentObject::Collation, self.parse_object_name(false)?),
+            Keyword::COLUMN => (CommentObject::Column, self.parse_object_name(false)?),
+            Keyword::DATABASE => (CommentObject::Database, self.parse_object_name(false)?),
+            Keyword::DOMAIN => (CommentObject::Domain, self.parse_object_name(false)?),
+            Keyword::EXTENSION => (CommentObject::Extension, self.parse_object_name(false)?),
+            Keyword::FUNCTION => (CommentObject::Function, self.parse_object_name(false)?),
+            Keyword::INDEX => (CommentObject::Index, self.parse_object_name(false)?),
+            Keyword::MATERIALIZED => {
                 self.expect_keyword_is(Keyword::VIEW)?;
                 (
                     CommentObject::MaterializedView,
                     self.parse_object_name(false)?,
                 )
             }
-            Token::Word(w) if w.keyword == Keyword::PROCEDURE => {
-                (CommentObject::Procedure, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::ROLE => {
-                (CommentObject::Role, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::SCHEMA => {
-                (CommentObject::Schema, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::SEQUENCE => {
-                (CommentObject::Sequence, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::TABLE => {
-                (CommentObject::Table, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::TYPE => {
-                (CommentObject::Type, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::USER => {
-                (CommentObject::User, self.parse_object_name(false)?)
-            }
-            Token::Word(w) if w.keyword == Keyword::VIEW => {
-                (CommentObject::View, self.parse_object_name(false)?)
-            }
-            _ => self.expected("comment object_type", token)?,
+            Keyword::PROCEDURE => (CommentObject::Procedure, self.parse_object_name(false)?),
+            Keyword::ROLE => (CommentObject::Role, self.parse_object_name(false)?),
+            Keyword::SCHEMA => (CommentObject::Schema, self.parse_object_name(false)?),
+            Keyword::SEQUENCE => (CommentObject::Sequence, self.parse_object_name(false)?),
+            Keyword::TABLE => (CommentObject::Table, self.parse_object_name(false)?),
+            Keyword::TYPE => (CommentObject::Type, self.parse_object_name(false)?),
+            Keyword::USER => (CommentObject::User, self.parse_object_name(false)?),
+            Keyword::VIEW => (CommentObject::View, self.parse_object_name(false)?),
+            _ => self.expected_at("comment object_type", at)?,
         };
 
         self.expect_keyword_is(Keyword::IS)?;
@@ -1027,7 +1002,12 @@ impl<'a> Parser<'a> {
             FlushType::OptimizerCosts
         } else if self.parse_keywords(&[Keyword::RELAY, Keyword::LOGS]) {
             if self.parse_keywords(&[Keyword::FOR, Keyword::CHANNEL]) {
-                channel = Some(self.parse_object_name(false).unwrap().to_string());
+                let before = self.kept.get();
+                let name = self.parse_object_name(false)?;
+                let held = self.kept.get() - before;
+                let text = self.format(format_args!("{name}"))?;
+                self.freed(name, held);
+                channel = Some(text);
             }
             FlushType::RelayLogs
         } else if self.parse_keywords(&[Keyword::SLOW, Keyword::LOGS]) {
@@ -1039,25 +1019,27 @@ impl<'a> Parser<'a> {
         } else if self.parse_keywords(&[Keyword::LOGS]) {
             FlushType::Logs
         } else if self.parse_keywords(&[Keyword::TABLES]) {
+            let mut tables_held = 0;
             loop {
-                let next_token = self.next_token();
-                match &next_token.token {
-                    Token::Word(w) => match w.keyword {
-                        Keyword::WITH => {
-                            read_lock = self.parse_keywords(&[Keyword::READ, Keyword::LOCK]);
-                        }
-                        Keyword::FOR => {
-                            export = self.parse_keyword(Keyword::EXPORT);
-                        }
-                        Keyword::NoKeyword => {
-                            self.prev_token();
-                            tables = self.parse_comma_separated(|p| p.parse_object_name(false))?;
-                        }
-                        _ => {}
-                    },
-                    _ => {
-                        break;
+                self.advance_token();
+                let keyword = match &self.get_current_token().token {
+                    Token::Word(w) => w.keyword,
+                    _ => break,
+                };
+                match keyword {
+                    Keyword::WITH => {
+                        read_lock = self.parse_keywords(&[Keyword::READ, Keyword::LOCK]);
                     }
+                    Keyword::FOR => {
+                        export = self.parse_keyword(Keyword::EXPORT);
+                    }
+                    Keyword::NoKeyword => {
+                        self.prev_token();
+                        let before = self.kept.get();
+                        let parsed = self.parse_comma_separated(|p| p.parse_object_name(false))?;
+                        self.set(&mut tables, &mut tables_held, before, parsed);
+                    }
+                    _ => {}
                 }
             }
 
@@ -1187,10 +1169,10 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                options.push(AttachDuckDBDatabaseOption::ReadOnly(boolean));
+                self.push(&mut options, AttachDuckDBDatabaseOption::ReadOnly(boolean))?;
             } else if self.parse_keyword(Keyword::TYPE) {
                 let ident = self.parse_identifier()?;
-                options.push(AttachDuckDBDatabaseOption::Type(ident));
+                self.push(&mut options, AttachDuckDBDatabaseOption::Type(ident))?;
             } else {
                 return self
                     .expected_ref("expected one of: ), READ_ONLY, TYPE", self.peek_token_ref());
