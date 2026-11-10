@@ -41,7 +41,7 @@ use crate::ast::{
     },
 };
 use crate::dialect::*;
-use crate::funding::{Funding, Measure, Refused, UNFUNDED};
+use crate::funding::{self, Funding, Refused, UNFUNDED};
 use crate::keywords::{Keyword, ALL_KEYWORDS};
 use crate::tokenizer::*;
 use sqlparser::parser::ParserState::ColumnDefinition;
@@ -136,7 +136,7 @@ impl From<TokenizerError> for ParserError {
         match kind {
             TokenizerErrorKind::OutOfMemory => ParserError::OutOfMemory { needed: 0 },
             TokenizerErrorKind::Syntax => {
-                let mut room = Measure(0);
+                let mut room = funding::Measure(0);
                 let fits = fmt::write(&mut room, format_args!("{location}")).is_ok()
                     && message.capacity() - message.len() >= room.0;
                 if fits {
